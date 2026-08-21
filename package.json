@@ -1,0 +1,24 @@
+{
+  "name": "pi-maxout",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/core.test.mjs",
+    "verify": "bash verify.sh"
+  },
+  "description": "A conservative /maxout command for the Pi coding agent.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/meowsigma/pi-maxout.git"
+  },
+  "keywords": [
+    "pi",
+    "coding-agent",
+    "extension",
+    "max-tokens",
+    "llama.cpp",
+    "openrouter"
+  ]
+}
