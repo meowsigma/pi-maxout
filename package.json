@@ -1,6 +1,6 @@
 {
   "name": "pi-maxout",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Provider-aware dynamic output-budget control for the Pi coding agent",
   "type": "module",
   "private": true,

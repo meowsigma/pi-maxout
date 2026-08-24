@@ -34,6 +34,8 @@ cp "$SRC_DIR/core.mjs" "$STAGE/core.mjs"
 cp "$SRC_DIR/core.d.mts" "$STAGE/core.d.mts"
 cp "$SRC_DIR/auto.mjs" "$STAGE/auto.mjs"
 cp "$SRC_DIR/auto.d.mts" "$STAGE/auto.d.mts"
+cp "$SRC_DIR/adaptive.mjs" "$STAGE/adaptive.mjs"
+cp "$SRC_DIR/adaptive.d.mts" "$STAGE/adaptive.d.mts"
 cp "$SRC_DIR/README.md" "$STAGE/README.md"
 
 if [[ -e "$DEST" ]]; then
@@ -45,7 +47,7 @@ mv "$STAGE" "$DEST"
 COMMITTED=1
 trap - EXIT
 
-printf 'Installed pi-maxout v2.1.0 to:\n  %s\n' "$DEST"
+printf 'Installed pi-maxout v2.2.0 to:\n  %s\n' "$DEST"
 if [[ -n "$BACKUP" ]]; then
   printf 'Previous extension backed up to:\n  %s\n' "$BACKUP"
 fi

@@ -689,3 +689,60 @@ test("learned profiles survive session reload and fresh sessions", () => {
   const storedProfile = readStateFile().adaptiveProfiles[`${KEY}:low`];
   assert.equal(storedProfile.capTarget, 16000, "ceiling-clamped learned values are what get persisted");
 });
+
+// ---------------------------------------------------------------------------
+// User controls & status (v2.2.0)
+// ---------------------------------------------------------------------------
+
+test("/maxout status reports the active learned profile", async () => {
+  seedProfile(`${KEY}:low`, {
+    capTarget: 12000,
+    reservationTarget: 8000,
+    capFloor: 8000,
+    capCeiling: 16000,
+    outputs: [4000, 6000],
+    pressureCount: 1,
+  });
+  await h.runCommand("status");
+  const text = h.ui.notifies.at(-1).message;
+  assert.match(text, /auto-adaptive \(cap 12\.0K @ low\)/);
+  assert.match(text, /learning: reserve 8\.0K • 2 recent outputs • compaction pressure 1/);
+});
+
+test("unlearned models show no learning line until they observe something", async () => {
+  h.ctx.getContextUsage = () => ({ tokens: 10000, contextWindow: LIMIT, percent: 8 });
+  const out = h.emit.before_provider_request({ payload: vllmPayload() });
+  assert.equal(out.max_tokens, 8000);
+  await h.runCommand("status");
+  assert.doesNotMatch(h.ui.notifies.at(-1).message, /learning:/, "a cold-start-only profile is not 'learned'");
+});
+
+test("/maxout learn reset clears only learning data", async () => {
+  // other settings that must survive the reset
+  await h.runCommand("margin 4096");
+  await h.runCommand("limit 100000");
+
+  seedProfile(`${KEY}:low`, { capTarget: 12000, reservationTarget: 12000, capFloor: 8000, capCeiling: 16000 });
+  seedProfile(`${KEY}:high`, { capTarget: 24000, reservationTarget: 24000, capFloor: 8000, capCeiling: 32000 });
+
+  await h.runCommand("learn reset");
+  let raw = readStateFile();
+  assert.deepEqual(raw.adaptiveProfiles, {}, "reset must clear every learned profile");
+  assert.equal(raw.safetyMarginTokens, 4096, "margin survives");
+  assert.equal(raw.contextLimits[KEY], 100000, "context-limit override survives");
+  assert.equal(raw.auto, true, "auto stays enabled");
+  assert.equal(raw.defaults[KEY], undefined, "no fixed default invented");
+
+  // the next request restarts from the cold start
+  h.ctx.getContextUsage = () => ({ tokens: 10000, contextWindow: LIMIT, percent: 8 });
+  assert.equal(h.emit.before_provider_request({ payload: vllmPayload() }).max_tokens, 8000);
+
+  // bare /maxout learn reports usage without destroying anything
+  seedProfile(`${KEY}:low`, { capTarget: 12000 });
+  await h.runCommand("learn");
+  raw = readStateFile();
+  assert.ok(raw.adaptiveProfiles[`${KEY}:low`], "bare 'learn' must not clear anything");
+
+  await h.runCommand("learn nonsense");
+  assert.ok(h.ui.notifies.some((n) => n.severity === "warning" && /Usage: \/maxout learn reset/.test(n.message)));
+});

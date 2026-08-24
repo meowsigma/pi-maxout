@@ -1,5 +1,5 @@
 /**
- * pi-maxout v2.1.0
+ * pi-maxout v2.2.0
  *
  * Provider-aware dynamic output-budget control for Pi.
  *
@@ -62,7 +62,7 @@ import {
   statusLine,
 } from "./auto.mjs";
 
-const VERSION = "2.1.0";
+const VERSION = "2.2.0";
 const STATUS_KEY = "pi-maxout";
 
 /** Resolved lazily so test harnesses and /reload cycles pick up the right dir. */
@@ -348,10 +348,15 @@ function describe(ctx: ExtensionContext): string {
   else lines.push(`${model.provider}/${model.id} (unkeyed)`);
 
   const overrideValue = key ? effectiveOverride(key, state) : null;
-  const loadedAdaptive = key && !overrideValue && state.auto ? loadAdaptiveProfile(key, state, ctx.thinkingLevel) : null;
-  const autoCap = loadedAdaptive
+  const learnedProfile =
+    key && !overrideValue && state.auto
+      ? (state.adaptiveProfiles[profileKey(key, ctx.thinkingLevel)] ?? null)
+      : null;
+  const hasLearnedData =
+    learnedProfile !== null && (learnedProfile.seq > 0 || learnedProfile.outputs.length > 0);
+  const autoCap = hasLearnedData
     ? Math.min(
-        loadedAdaptive.profile.capTarget,
+        learnedProfile.capTarget,
         Number.isSafeInteger(Number(model.maxTokens)) && Number(model.maxTokens) > 0 ? Number(model.maxTokens) : Infinity,
       )
     : desiredOutputTarget(model, key ?? "", state, ctx.thinkingLevel);
@@ -362,8 +367,8 @@ function describe(ctx: ExtensionContext): string {
       : "provider default (dynamic off)";
   lines.push(`mode: ${modeLabel}`);
 
-  if (loadedAdaptive) {
-    const p = loadedAdaptive.profile;
+  if (hasLearnedData) {
+    const p = learnedProfile;
     const declaredMax = Number(model.maxTokens);
     const reserve = Number.isSafeInteger(declaredMax) && declaredMax > 0 ? Math.min(p.reservationTarget, declaredMax) : p.reservationTarget;
     lines.push(

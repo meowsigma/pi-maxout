@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.2.0
+
+- Auto mode now learns per-model output budgets: a new pure controller
+  (`adaptive.mjs`) tracks separate cap and compaction-reservation targets per
+  `provider:model:thinkingLevel` on a discrete decimal-token ladder with
+  conservative cold starts (8K/16K/32K by thinking level).
+- Attributable explicit length stops raise both targets one rung immediately;
+  successful outputs grow only the reservation from bounded recent p90 output
+  (+25%), never above the cap.
+- Two successful maxout-initiated compactions within eight observed responses
+  downshift one rung (hysteresis); failed, manual, and Pi-core compactions
+  never create pressure.
+- Learned profiles persist in state-schema v3 (v1/v2 migrate automatically)
+  with validated, size-bounded histories, lazy 14-day decay toward cold start,
+  and 90-day expiry.
+- Proactive compaction is justified by the learned reservation target rather
+  than the cap target; fixed overrides, unsupported APIs, provider ceilings,
+  overflow-margin learning, retry semantics, and the hard
+  input + max_tokens <= context_limit invariant are unchanged.
+- Adds `/maxout learn reset` (clears only learning data), learned-profile
+  status reporting, installer/verifier packaging of the new modules, and
+  focused deterministic plus randomized controller coverage.
+
 ## 2.1.0
 
 - Recalculates provider-aware output budgets on every main request using

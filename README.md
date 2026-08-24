@@ -1,4 +1,4 @@
-# pi-maxout v2.1.0
+# pi-maxout v2.2.0
 
 Provider-aware dynamic output-budget control for Pi. v2 turns `maxout:auto`
 into a per-request dynamic budgeting system that prevents the known
@@ -48,19 +48,55 @@ Tool-less active main requests are still budgeted. Idle summaries and active
 auto/overflow-compaction requests are explicitly excluded so they retain Pi
 core's own summary budgets.
 
-## Thinking-level targets
+## Adaptive auto (v2.2.0)
 
-| level              | target |
-| ------------------ | ------ |
+Dynamic auto mode is no longer a static lookup table: it **learns** two
+separate targets per `provider:model:thinkingLevel`, persisted in the state
+file with bounded history:
+
+- **cap target** — the completion ceiling patched into requests;
+- **reservation target** — the completion room worth compacting history for.
+
+Both live on a discrete decimal ladder (8K, 12K, 16K, 24K, 32K, 40K, 48K,
+56K). Cold starts are conservative per thinking level (off/minimal/low/medium:
+8K, high: 16K, xhigh/max: 32K) and equal for cap and reservation.
+
+Learning rules:
+
+- An explicit length stop attributable to the current patched attempt raises
+  both targets one rung immediately, bounded by the configured thinking-level
+  target and the model's advertised `maxTokens`.
+- Successful non-truncated outputs keep the latest twelve positive output
+  samples; the reservation may rise to the nearest rung at or above
+  1.25 × recent p90 output, never above the cap. Ordinary short answers lower
+  nothing.
+- A successful maxout-initiated compaction adds pressure; two compactions
+  within eight observed main responses and no truncation in between downshift
+  both targets one rung (never below cold start), then clear the window.
+  Failed, manual, and Pi-core compactions add no pressure.
+- Profiles decay lazily one rung toward cold start per complete 14 days since
+  their last update and are dropped after 90 days.
+
+Compaction triggers on the *reservation* target only — a large learned cap
+does not by itself force compaction when recent outputs are short. Fixed
+session/saved overrides bypass learning entirely, and unsupported payload
+APIs still fail open without creating a learnable attempt.
+
+## Thinking-level fallbacks
+
+When no profile has learned yet, auto mode falls back to the static targets:
+
+| level              | fallback |
+| ------------------ | -------- |
 | off/minimal/low/medium | 16 000 |
 | high               | 32 000 |
 | xhigh/max          | 56 000 (~50K reasoning + answer/tools) |
 
 Targets clamp to actual headroom; they are never allowed to produce an
-oversized or zero/negative request. The auto target also honors what the model
-advertises (`model.maxTokens`): a table target above the advertised output
-limit clamps to it. Custom targets can be set per level via
-the state file (`targets`).
+oversized or zero/negative request. The adaptive ceiling also honors what the
+model advertises (`model.maxTokens`): a target above the advertised output
+limit clamps to it. Custom ceilings can be set per level via the state file
+(`targets`).
 
 ## Overflow handling
 
@@ -99,15 +135,16 @@ compaction.
 | `/maxout auto` / `/maxout save auto` | dynamic budgeting on (default); removes any session override AND saved fixed default for this model |
 | `/maxout 32k` … `/maxout max` | fixed cap for this session (still safety-clamped to remaining context) |
 | `/maxout save <spec>` | persist fixed cap; `/maxout save auto` enables auto and deletes the saved default |
+| `/maxout learn reset` | clear all learned adaptive budgets; fixed caps, context limits, margins, and custom ceilings are untouched |
 | `/maxout margin [n]` | view/set safety margin (min 1024, default 2048) |
 | `/maxout limit [n\|clear]` | view/set/clear per-model context-limit override (values ABOVE the catalog window are allowed — that is its purpose) |
 
-State lives in `~/.pi/agent/pi-maxout.json` (schema v2; v1 files migrate
+State lives in `~/.pi/agent/pi-maxout.json` (schema v3; v1/v2 files migrate
 automatically):
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "auto": true,
   "safetyMarginTokens": 2048,
   "targets": {},
