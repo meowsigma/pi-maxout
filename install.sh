@@ -23,12 +23,17 @@ command -v node >/dev/null 2>&1 || {
 }
 
 echo "Running bundled tests..."
-node --test "$SRC_DIR/tests/core.test.mjs"
+(
+  cd "$SRC_DIR"
+  node --experimental-strip-types --test
+)
 
 mkdir -p "$EXTENSIONS_DIR" "$STAGE"
 cp "$SRC_DIR/index.ts" "$STAGE/index.ts"
 cp "$SRC_DIR/core.mjs" "$STAGE/core.mjs"
 cp "$SRC_DIR/core.d.mts" "$STAGE/core.d.mts"
+cp "$SRC_DIR/auto.mjs" "$STAGE/auto.mjs"
+cp "$SRC_DIR/auto.d.mts" "$STAGE/auto.d.mts"
 cp "$SRC_DIR/README.md" "$STAGE/README.md"
 
 if [[ -e "$DEST" ]]; then
@@ -40,7 +45,7 @@ mv "$STAGE" "$DEST"
 COMMITTED=1
 trap - EXIT
 
-printf 'Installed pi-maxout v1.0.0 to:\n  %s\n' "$DEST"
+printf 'Installed pi-maxout v2.1.0 to:\n  %s\n' "$DEST"
 if [[ -n "$BACKUP" ]]; then
   printf 'Previous extension backed up to:\n  %s\n' "$BACKUP"
 fi
@@ -51,4 +56,6 @@ Restart Pi or run /reload, then use:
   /maxout 32k
   /maxout save 32k
   /maxout auto
+  /maxout margin 4096
+  /maxout limit 131072
 MSG

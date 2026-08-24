@@ -44,7 +44,14 @@ test("rejects values beyond context and max without metadata", () => {
 test("normalizes state and drops malformed entries", () => {
   assert.deepEqual(
     normalizeState({ version: 999, defaults: { "a:b": 32768, bad: -1, nope: "32k" } }),
-    { version: 1, defaults: { "a:b": 32768 } },
+    {
+      version: 2,
+      defaults: { "a:b": 32768 },
+      auto: true,
+      safetyMarginTokens: 2048,
+      targets: {},
+      contextLimits: {},
+    },
   );
 });
 

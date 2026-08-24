@@ -1,4 +1,10 @@
-export const STATE_VERSION = 1;
+export const STATE_VERSION = 2;
+
+/** Default safety margin (tokens) when unconfigured. Must stay >= MIN_MARGIN_TOKENS. */
+const DEFAULT_STATE_MARGIN = 2048;
+const MIN_STATE_MARGIN = 1024;
+const KNOWN_TARGET_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const UNSAFE_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 
 export function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -20,7 +26,15 @@ export function formatTokens(value) {
   return String(n);
 }
 
-export function parseTokenSpec(raw, model) {
+/**
+ * Parse a user-provided token spec.
+ *
+ * options.allowAboveCatalogContext — permit values above the model's catalog
+ * context window. Needed by `/maxout limit`, whose whole purpose is correcting
+ * catalogs that lie about the real window (local vLLM servers especially).
+ * Fixed caps (`/maxout 32k`) keep the catalog guard.
+ */
+export function parseTokenSpec(raw, model, options = {}) {
   const text = String(raw ?? "").trim().toLowerCase().replaceAll("_", "");
 
   if (!text || text === "status") return { kind: "status" };
@@ -54,8 +68,14 @@ export function parseTokenSpec(raw, model) {
     return { kind: "error", message: "The token cap must be a positive safe integer." };
   }
 
+  const allowAboveCatalog = options?.allowAboveCatalogContext === true;
   const contextWindow = Number(model?.contextWindow);
-  if (Number.isSafeInteger(contextWindow) && contextWindow > 0 && value > contextWindow) {
+  if (
+    !allowAboveCatalog &&
+    Number.isSafeInteger(contextWindow) &&
+    contextWindow > 0 &&
+    value > contextWindow
+  ) {
     return {
       kind: "error",
       message: `Requested ${formatTokens(value)} exceeds the model context window (${formatTokens(contextWindow)}).`,
@@ -65,16 +85,57 @@ export function parseTokenSpec(raw, model) {
   return { kind: "value", value };
 }
 
+/**
+ * Normalize persisted state to the v2 schema.
+ *
+ * Shape:
+ *   {
+ *     version: 2,
+ *     defaults: { "provider:model": fixedMaxTokens },   // legacy v1 overrides
+ *     auto: boolean,                                    // dynamic budgeting on/off
+ *     safetyMarginTokens: number,                       // >= 1024
+ *     targets: { level: tokens },                       // per-thinking-level targets
+ *     contextLimits: { "provider:model": tokens }       // per-model context-limit fixes
+ *   }
+ *
+ * Accepts v1 files ({version:1, defaults}) and arbitrary garbage; output is
+ * always safe and complete.
+ */
 export function normalizeState(value) {
+  const src = isRecord(value) ? value : {};
+
   const defaults = {};
-  if (isRecord(value) && isRecord(value.defaults)) {
-    for (const [key, candidate] of Object.entries(value.defaults)) {
-      if (typeof key !== "string" || key.length === 0) continue;
-      if (key === "__proto__" || key === "prototype" || key === "constructor") continue;
+  if (isRecord(src.defaults)) {
+    for (const [key, candidate] of Object.entries(src.defaults)) {
+      if (typeof key !== "string" || key.length === 0 || UNSAFE_KEYS.has(key)) continue;
       if (Number.isSafeInteger(candidate) && candidate > 0) defaults[key] = candidate;
     }
   }
-  return { version: STATE_VERSION, defaults };
+
+  const auto = typeof src.auto === "boolean" ? src.auto : true;
+
+  let safetyMarginTokens = DEFAULT_STATE_MARGIN;
+  if (Number.isSafeInteger(src.safetyMarginTokens)) {
+    safetyMarginTokens = Math.max(MIN_STATE_MARGIN, src.safetyMarginTokens);
+  }
+
+  const targets = {};
+  if (isRecord(src.targets)) {
+    for (const [key, candidate] of Object.entries(src.targets)) {
+      if (!KNOWN_TARGET_LEVELS.has(key)) continue;
+      if (Number.isSafeInteger(candidate) && candidate > 0) targets[key] = candidate;
+    }
+  }
+
+  const contextLimits = {};
+  if (isRecord(src.contextLimits)) {
+    for (const [key, candidate] of Object.entries(src.contextLimits)) {
+      if (typeof key !== "string" || key.length === 0 || UNSAFE_KEYS.has(key)) continue;
+      if (Number.isSafeInteger(candidate) && candidate > 0) contextLimits[key] = candidate;
+    }
+  }
+
+  return { version: STATE_VERSION, defaults, auto, safetyMarginTokens, targets, contextLimits };
 }
 
 function cloneRoot(payload) {
@@ -98,6 +159,47 @@ function compatMaxTokensField(model) {
   const compat = isRecord(model?.compat) ? model.compat : null;
   const value = compat?.maxTokensField;
   return value === "max_completion_tokens" || value === "max_tokens" ? value : null;
+}
+
+// ---------------------------------------------------------------------------
+// Thinking-budget passthrough (xhigh/max reasoning models)
+// ---------------------------------------------------------------------------
+
+/** Hard ceiling for an already-present numeric thinking_token_budget. */
+export const MAX_THINKING_BUDGET_TOKENS = 50000;
+/** Headroom kept between the thinking budget and the final completion cap. */
+export const THINKING_BUDGET_HEADROOM_TOKENS = 4096;
+
+/**
+ * Rewrite an EXISTING numeric `thinking_token_budget` for xhigh/max requests:
+ *   budget = min(50000, max(0, finalCap - 4096))
+ * Keeps the advertised reasoning budget consistent with the (possibly clamped)
+ * completion cap so reasoning + answer still fit together. Payloads without a
+ * pre-existing numeric budget are never touched, and lower thinking modes are
+ * left alone entirely (their budgets belong to smaller targets).
+ */
+export function patchThinkingBudgetPayload(payload, cap, thinkingLevel) {
+  const level = typeof thinkingLevel === "string" ? thinkingLevel : "off";
+  if (level !== "xhigh" && level !== "max") {
+    return { payload, changed: false, field: null, reason: "thinking-mode-not-xhigh" };
+  }
+  if (!isRecord(payload)) {
+    return { payload, changed: false, field: null, reason: "invalid-payload" };
+  }
+  const existing = payload.thinking_token_budget;
+  if (!Number.isSafeInteger(existing) || existing <= 0) {
+    // Absent budgets stay absent — we never invent provider-specific fields.
+    return { payload, changed: false, field: null, reason: "no-existing-thinking-budget" };
+  }
+  const finalCap = Number.isSafeInteger(cap) ? cap : 0;
+  const budget = Math.min(
+    MAX_THINKING_BUDGET_TOKENS,
+    Math.max(0, finalCap - THINKING_BUDGET_HEADROOM_TOKENS),
+  );
+  if (budget === existing) {
+    return { payload, changed: false, field: null, reason: "thinking-budget-unchanged" };
+  }
+  return { payload: { ...payload, thinking_token_budget: budget }, changed: true, field: "thinking_token_budget" };
 }
 
 /**

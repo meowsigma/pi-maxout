@@ -1,13 +1,20 @@
 {
   "name": "pi-maxout",
-  "version": "1.0.0",
-  "private": true,
+  "version": "2.1.0",
+  "description": "Provider-aware dynamic output-budget control for the Pi coding agent",
   "type": "module",
+  "private": true,
   "scripts": {
-    "test": "node --test tests/core.test.mjs",
+    "test": "node --experimental-strip-types --test",
+    "typecheck": "tsc --noEmit",
     "verify": "bash verify.sh"
   },
-  "description": "A conservative /maxout command for the Pi coding agent.",
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.3",
+    "@earendil-works/pi-coding-agent": "^0.84.3",
+    "@types/node": "^26.2.0",
+    "typescript": "^5.9.3"
+  },
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -19,6 +26,7 @@
     "extension",
     "max-tokens",
     "llama.cpp",
+    "vllm",
     "openrouter"
   ]
 }

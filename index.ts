@@ -1,14 +1,29 @@
 /**
- * pi-maxout v1.0.0
+ * pi-maxout v2.1.0
  *
- * A conservative, provider-aware /maxout command for Pi.
- * It changes only the final outgoing completion cap. It does not alter reasoning
- * effort, context size, model metadata, or llama.cpp launch settings.
+ * Provider-aware dynamic output-budget control for Pi.
+ *
+ * In dynamic auto mode every provider request gets:
+ *
+ *   safe_max_output = context_limit - conservative_input_estimate - safety_margin
+ *   max_tokens      = min(thinking_level_target, safe_max_output)   [>= 1, never negative]
+ *
+ * Guarantees:
+ *   input + requested <= context_limit for every patched request (fixed user
+ *   overrides included), so the local vLLM 131072-token rejection class cannot
+ *   happen again. Targets: normal 16K, high 32K, xhigh 56K (clamped to what
+ *   actually fits — xhigh reasoning may legitimately use ~50K).
+ *
+ * Overflow handling: a pre-stream 400/413 (or an assistant-level context-
+ * overflow error) doubles a per-model margin boost so Pi's built-in single
+ * compact-and-retry re-runs with a larger margin. Nothing is ever re-sent by
+ * this extension itself; no retry happens after streaming started.
  */
 
 import fs from "node:fs";
 import path from "node:path";
 
+import { isContextOverflow } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type {
   ExtensionAPI,
@@ -22,23 +37,60 @@ import {
   normalizeState,
   parseTokenSpec,
   patchMaxTokensPayload,
+  patchThinkingBudgetPayload,
 } from "./core.mjs";
+import {
+  MAX_MARGIN_BOOST_TOKENS,
+  MIN_MARGIN_TOKENS,
+  combineInputEstimates,
+  estimatePayloadInputTokens,
+  effectiveMargin,
+  formatK,
+  nextMarginBoost,
+  resolveContextLimit,
+  resolveRequestCap,
+  resolveTargetTokens,
+  shouldSkipPayload,
+  statusLine,
+} from "./auto.mjs";
 
-const VERSION = "1.0.0";
+const VERSION = "2.1.0";
 const STATUS_KEY = "pi-maxout";
-const STATE_PATH = path.join(getAgentDir(), "pi-maxout.json");
+
+/** Resolved lazily so test harnesses and /reload cycles pick up the right dir. */
+function statePath(): string {
+  return path.join(getAgentDir(), "pi-maxout.json");
+}
+
+/** Minimum gap between proactive compaction attempts per model. */
+const COMPACTION_COOLDOWN_MS = 5 * 60 * 1000;
+
+type StateShape = ReturnType<typeof normalizeState>;
 
 const sessionOverrides = new Map<string, number>();
-const lastPatch = new Map<string, { cap: number; field: string | null; reason?: string }>();
+const lastPatch = new Map<
+  string,
+  { cap: number; field: string | null; reason?: string; clamped?: boolean; degraded?: boolean }
+>();
+const lastInputEstimate = new Map<string, number>();
+const marginBoosts = new Map<string, number>();
+const lastCompactionAttempt = new Map<string, number>();
+let compacting = false;
+/** Prevent sizing Pi's own compaction-summary provider request. */
+let providerSizingSuspended = false;
+type SizedAttempt = { key: string; learned: boolean; streamStarted: boolean };
+/** The main request currently awaiting/consuming a provider response. */
+let currentAttempt: SizedAttempt | null = null;
 
 type StateRead = {
-  state: { version: number; defaults: Record<string, number> };
+  state: StateShape;
   error?: string;
 };
 
 function readState(): StateRead {
+  const stateFile = statePath();
   try {
-    const raw = fs.readFileSync(STATE_PATH, "utf8");
+    const raw = fs.readFileSync(stateFile, "utf8");
     return { state: normalizeState(JSON.parse(raw)) };
   } catch (error) {
     const code = (error as NodeJS.ErrnoException)?.code;
@@ -54,26 +106,27 @@ function timestampForFilename(): string {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
-function writeState(state: { version: number; defaults: Record<string, number> }): string | undefined {
-  fs.mkdirSync(path.dirname(STATE_PATH), { recursive: true });
+function writeState(state: StateShape): string | undefined {
+  const stateFile = statePath();
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
 
   const current = readState();
   let backupPath: string | undefined;
-  if (current.error && fs.existsSync(STATE_PATH)) {
-    backupPath = `${STATE_PATH}.invalid-${timestampForFilename()}`;
-    fs.copyFileSync(STATE_PATH, backupPath);
+  if (current.error && fs.existsSync(stateFile)) {
+    backupPath = `${stateFile}.invalid-${timestampForFilename()}`;
+    fs.copyFileSync(stateFile, backupPath);
   }
 
-  const tempPath = `${STATE_PATH}.tmp-${process.pid}-${Date.now()}`;
+  const tempPath = `${stateFile}.tmp-${process.pid}-${Date.now()}`;
   try {
     fs.writeFileSync(tempPath, `${JSON.stringify(normalizeState(state), null, 2)}\n`, {
       encoding: "utf8",
       mode: 0o600,
       flag: "wx",
     });
-    fs.renameSync(tempPath, STATE_PATH);
+    fs.renameSync(tempPath, stateFile);
     try {
-      fs.chmodSync(STATE_PATH, 0o600);
+      fs.chmodSync(stateFile, 0o600);
     } catch {
       // Some non-POSIX filesystems do not support chmod; the atomic write still succeeded.
     }
@@ -88,86 +141,261 @@ function writeState(state: { version: number; defaults: Record<string, number> }
   return backupPath;
 }
 
-function effectiveOverride(model: ExtensionContext["model"]): {
-  key: string | null;
-  value: number | null;
-  source: "none" | "session" | "saved" | "provider";
-  stateError?: string;
-} {
-  const key = modelKey(model);
-  if (!key) return { key: null, value: null, source: "none" };
-
+function effectiveOverride(key: string | null, state: StateShape): number | null {
+  if (!key) return null;
   const sessionValue = sessionOverrides.get(key);
   if (Number.isSafeInteger(sessionValue) && (sessionValue ?? 0) > 0) {
-    return { key, value: sessionValue ?? null, source: "session" };
+    return sessionValue ?? null;
   }
-
-  const loaded = readState();
-  const savedValue = loaded.state.defaults[key];
+  const savedValue = state.defaults[key];
   if (Number.isSafeInteger(savedValue) && savedValue > 0) {
-    return { key, value: savedValue, source: "saved", stateError: loaded.error };
+    return savedValue;
+  }
+  return null;
+}
+
+function desiredOutputTarget(
+  model: ExtensionContext["model"],
+  key: string,
+  state: StateShape,
+  thinkingLevel: ExtensionContext["thinkingLevel"],
+): number {
+  const override = effectiveOverride(key, state);
+  if (override) return override;
+  const target = resolveTargetTokens(thinkingLevel, state.targets);
+  const declared = Number(model?.maxTokens);
+  return Number.isSafeInteger(declared) && declared > 0 ? Math.min(target, declared) : target;
+}
+
+function notifyOnce(
+  ctx: ExtensionContext,
+  dedupeKey: string,
+  message: string,
+  severity: "info" | "warning" = "warning",
+): void {
+  const seen = notified.get(dedupeKey);
+  if (seen === message) return;
+  notified.set(dedupeKey, message);
+  ctx.ui.notify(`pi-maxout: ${message}`, severity);
+}
+const notified = new Map<string, string>();
+
+/** Drop every boost notification for a model — used when its boost resets. */
+function clearBoostNotifications(key: string): void {
+  const prefix = `boost:${key}:`;
+  for (const dedupeKey of [...notified.keys()]) {
+    if (dedupeKey.startsWith(prefix)) notified.delete(dedupeKey);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Status line
+// ---------------------------------------------------------------------------
+
+function refreshStatus(ctx: ExtensionContext): void {
+  const model = ctx.model;
+  const key = modelKey(model);
+  if (!model || !key) {
+    ctx.ui.setStatus(STATUS_KEY, "");
+    return;
   }
 
-  return { key, value: null, source: "provider", stateError: loaded.error };
-}
+  const { state } = readState();
+  const overrideValue = effectiveOverride(key, state);
+  const contextLimit = resolveContextLimit(model, state);
 
-function statusLabel(ctx: ExtensionContext): string {
-  const current = effectiveOverride(ctx.model);
-  if (!current.value) return "maxout:auto";
-  const previous = current.key ? lastPatch.get(current.key) : undefined;
-  const failed = previous && previous.cap === current.value && !previous.field;
-  return `maxout:${formatTokens(current.value)}${failed ? "!" : ""}`;
-}
+  // Preview of what the next request would request (same math as the live path).
+  let cap: number | null = null;
+  const flags: string[] = [];
+  if (!overrideValue && !state.auto) cap = null;
 
-function updateStatus(ctx: ExtensionContext): void {
-  ctx.ui.setStatus(STATUS_KEY, statusLabel(ctx));
+  const usage = ctx.getContextUsage();
+  const inputEstimate = combineInputEstimates(usage?.tokens ?? null, lastInputEstimate.get(key) ?? null);
+
+  if ((overrideValue || state.auto) && contextLimit && inputEstimate !== null) {
+    const decision = resolveRequestCap({
+      mode: overrideValue ? "override" : "auto",
+      requestedOverride: overrideValue ?? undefined,
+      contextLimit,
+      inputTokens: inputEstimate,
+      thinkingLevel: ctx.thinkingLevel,
+      marginTokens: state.safetyMarginTokens,
+      marginBoost: marginBoosts.get(key) ?? 0,
+      customTargets: state.targets,
+      modelMaxTokens: model.maxTokens,
+    });
+    cap = decision.exhausted ? null : decision.cap;
+    if (decision.clamped) flags.push("clamped");
+    if (decision.degraded) flags.push("low-room");
+  }
+  if ((marginBoosts.get(key) ?? 0) > 0) flags.push(`+margin ${formatK(marginBoosts.get(key) ?? 0)}`);
+  const patch = lastPatch.get(key);
+  if (patch?.field == null && patch) flags.push("unapplied!");
+
+  ctx.ui.setStatus(
+    STATUS_KEY,
+    statusLine({ inputTokens: inputEstimate, cap, contextLimit, flags }),
+  );
 }
 
 function describe(ctx: ExtensionContext): string {
   const model = ctx.model;
   if (!model) return "No active model.";
+  const key = modelKey(model);
+  const { state, error } = readState();
 
-  const current = effectiveOverride(model);
-  const declared = Number(model.maxTokens);
-  const context = Number(model.contextWindow);
-  const previous = current.key ? lastPatch.get(current.key) : undefined;
+  const lines: string[] = [];
+  if (key) lines.push(`${model.provider}/${model.id}`);
+  else lines.push(`${model.provider}/${model.id} (unkeyed)`);
 
-  const lines = [
-    `${model.provider}/${model.id}`,
-    `override: ${current.value ? formatTokens(current.value) : "auto"} (${current.source})`,
-    `Pi declared max-out: ${Number.isSafeInteger(declared) && declared > 0 ? formatTokens(declared) : "unknown"}`,
-    `context: ${Number.isSafeInteger(context) && context > 0 ? formatTokens(context) : "unknown"}`,
-  ];
+  const overrideValue = key ? effectiveOverride(key, state) : null;
+  const modeLabel = overrideValue
+    ? `fixed ${formatTokens(overrideValue)} (${sessionOverrides.has(key ?? "") ? "session" : "saved"})`
+    : state.auto
+      ? `auto-dynamic (target ${formatK(desiredOutputTarget(model, key ?? "", state, ctx.thinkingLevel))} @ ${ctx.thinkingLevel})`
+      : "provider default (dynamic off)";
+  lines.push(`mode: ${modeLabel}`);
 
-  if (previous && current.value && previous.cap === current.value) {
-    lines.push(
-      previous.field
-        ? `last request patch: ${previous.field}=${previous.cap}`
-        : `last request patch: not applied (${previous.reason ?? "unsupported payload"})`,
-    );
-  } else {
-    lines.push("last request patch: not observed for this setting yet");
+  const limit = resolveContextLimit(model, state);
+  lines.push(
+    `context limit: ${
+      limit ? formatK(limit) : "unknown"
+    }${key && state.contextLimits[key] ? " (override)" : ""}`,
+  );
+  const boost = key ? (marginBoosts.get(key) ?? 0) : 0;
+  lines.push(
+    `margin: ${formatK(effectiveMargin(state.safetyMarginTokens, boost, limit ?? Number.MAX_SAFE_INTEGER))}${
+      boost > 0 ? ` (base ${formatK(state.safetyMarginTokens)} + boost ${formatK(boost)}, max ${formatK(MAX_MARGIN_BOOST_TOKENS)})` : ""
+    }`,
+  );
+
+  if (key) {
+    const previous = lastPatch.get(key);
+    const input = lastInputEstimate.get(key);
+    if (previous && previous.field) {
+      lines.push(
+        `last request: ${previous.field}=${formatK(previous.cap)}${
+          previous.clamped ? " (clamped)" : ""
+        }${previous.degraded ? " (margin degraded)" : ""}`,
+      );
+    } else if (previous) {
+      lines.push(`last request patch: not applied (${previous.reason ?? "unsupported payload"})`);
+    } else {
+      lines.push("last request patch: not observed yet");
+    }
+    if (input != null) lines.push(`last input estimate: ${formatK(input)}`);
   }
 
-  if (current.value && Number.isSafeInteger(declared) && declared > 0 && current.value > declared) {
-    lines.push("warning: override exceeds Pi's catalog max-out; the provider/server may clamp or reject it.");
-  }
-  if (current.stateError) lines.push(`state warning: ${current.stateError}`);
+  if (error) lines.push(`state warning: ${error}`);
   lines.push(`extension: pi-maxout v${VERSION}`);
-
   return lines.join("\n");
 }
 
 function notifyResult(ctx: ExtensionCommandContext, backupPath?: string): void {
-  updateStatus(ctx);
+  refreshStatus(ctx);
   const pending = ctx.isIdle() ? "" : "\nApplies to the next provider request.";
   const backup = backupPath ? `\nBacked up invalid state to: ${backupPath}` : "";
   ctx.ui.notify(`${describe(ctx)}${pending}${backup}`, "info");
 }
 
+// ---------------------------------------------------------------------------
+// Margin learning (overflow → larger margin for the retried request)
+// ---------------------------------------------------------------------------
+
+function boostMargin(ctx: ExtensionContext, key: string): void {
+  if (!currentAttempt || currentAttempt.key !== key || currentAttempt.learned) return;
+  const before = marginBoosts.get(key) ?? 0;
+  const after = nextMarginBoost(before, "overflow");
+  if (after === before) return;
+  currentAttempt.learned = true;
+  marginBoosts.set(key, after);
+  notifyOnce(
+    ctx,
+    `boost:${key}:${after}`,
+    `context overflow detected — retry will use a larger safety margin (+${formatK(after)} tokens).`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Proactive compaction when headroom is too small for the selected mode
+// ---------------------------------------------------------------------------
+
+/**
+ * Proactively compact when headroom is too small for the selected mode.
+ *
+ * Awaitable on purpose: before_agent_start awaits it so Pi's compaction fully
+ * settles BEFORE the agent loop issues its first provider request — otherwise
+ * the main request and the summarizer race for the same context window and
+ * both fail. The cooldown timestamp is recorded up front (so concurrent
+ * callers cannot double-schedule), and `compacting` is always cleaned up —
+ * including on errors — so a failed attempt can never wedge the flag on.
+ */
+async function maybeCompactForHeadroom(ctx: ExtensionContext): Promise<void> {
+  const model = ctx.model;
+  const key = modelKey(model);
+  if (!model || !key || compacting || !ctx.isIdle()) return;
+
+  const { state } = readState();
+  const overrideValue = effectiveOverride(key, state);
+  if (!state.auto && !overrideValue) return;
+  const contextLimit = resolveContextLimit(model, state);
+  if (!contextLimit) return;
+
+  const usage = ctx.getContextUsage();
+  const tokens = usage?.tokens;
+  if (!tokens) return; // unknown (fresh/just-compacted) — nothing to act on
+
+  const target = desiredOutputTarget(model, key, state, ctx.thinkingLevel);
+  const margin = effectiveMargin(state.safetyMarginTokens, marginBoosts.get(key) ?? 0, contextLimit);
+  const remaining = contextLimit - tokens - margin;
+
+  if (remaining >= target) return; // enough headroom for the selected mode
+
+  const now = Date.now();
+  const lastAttempt = lastCompactionAttempt.get(key) ?? 0;
+  const urgent = remaining < MIN_MARGIN_TOKENS + 1024; // can't fit even a tiny answer
+  if (!urgent && now - lastAttempt < COMPACTION_COOLDOWN_MS) return;
+
+  lastCompactionAttempt.set(key, now);
+  compacting = true;
+  notifyOnce(
+    ctx,
+    `compact:${key}:${Math.floor(now / COMPACTION_COOLDOWN_MS)}`,
+    `only ${formatK(Math.max(remaining, 0))} of headroom left but ${ctx.thinkingLevel} wants ${formatK(
+      target,
+    )} — auto-compaction scheduled.`,
+    urgent ? "warning" : "info",
+  );
+  let completed = false;
+  try {
+    await new Promise<void>((resolve) => {
+      try {
+        ctx.compact({
+          onComplete: () => {
+            completed = true;
+            resolve();
+          },
+          onError: () => resolve(),
+        });
+      } catch {
+        resolve(); // synchronous throw from the runtime must not wedge us either
+      }
+    });
+  } finally {
+    if (!completed) lastCompactionAttempt.delete(key); // failed compaction may retry immediately
+    compacting = false;
+    providerSizingSuspended = false;
+    refreshStatus(ctx);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Extension entry point
+// ---------------------------------------------------------------------------
+
 export default function maxoutExtension(pi: ExtensionAPI): void {
   pi.registerCommand("maxout", {
-    description: "Inspect or change the provider completion-token cap",
+    description: "Inspect or change the provider completion-token budget",
     getArgumentCompletions: (prefix) => {
       const options = [
         "status",
@@ -183,6 +411,9 @@ export default function maxoutExtension(pi: ExtensionAPI): void {
         "save 64k",
         "save 128k",
         "save max",
+        "margin",
+        "limit",
+        "limit clear",
       ];
       const value = String(prefix ?? "").trimStart().toLowerCase();
       const matches = options.filter((option) => option.startsWith(value));
@@ -197,8 +428,60 @@ export default function maxoutExtension(pi: ExtensionAPI): void {
       }
 
       const raw = String(args ?? "").trim();
+
+      if (/^margin(?:\s+\S+)?$/i.test(raw)) {
+        const valueRaw = raw.split(/\s+/)[1];
+        if (!valueRaw) {
+          const { state } = readState();
+          ctx.ui.notify(
+            `pi-maxout: safety margin ${state.safetyMarginTokens} tokens (min ${MIN_MARGIN_TOKENS}). Usage: /maxout margin 4096`,
+            "info",
+          );
+          return;
+        }
+        const parsed = parseTokenSpec(valueRaw, model);
+        if (parsed.kind !== "value") {
+          ctx.ui.notify(parsed.kind === "error" ? parsed.message : "Provide a token count, e.g. /maxout margin 4096", "warning");
+          return;
+        }
+        const loaded = readState();
+        const next = normalizeState(loaded.state);
+        next.safetyMarginTokens = Math.max(MIN_MARGIN_TOKENS, parsed.value);
+        writeState(next);
+        notifyResult(ctx);
+        return;
+      }
+
+      if (/^limit(?:\s+\S+)?$/i.test(raw)) {
+        const valueRaw = raw.split(/\s+/)[1];
+        const loaded = readState();
+        const next = normalizeState(loaded.state);
+        if (!valueRaw) {
+          const current = next.contextLimits[key];
+          ctx.ui.notify(
+            `pi-maxout: context limit for ${key}: ${current ? formatK(current) : "catalog default"}. Usage: /maxout limit 131072 | /maxout limit clear`,
+            "info",
+          );
+          return;
+        }
+        if (valueRaw.toLowerCase() === "clear") delete next.contextLimits[key];
+        else {
+          // Limit overrides exist precisely to correct lying catalogs, so they
+          // are allowed above the advertised context window (fixed caps are not).
+          const parsed = parseTokenSpec(valueRaw, model, { allowAboveCatalogContext: true });
+          if (parsed.kind !== "value") {
+            ctx.ui.notify(parsed.kind === "error" ? parsed.message : "Provide a token count or 'clear'.", "warning");
+            return;
+          }
+          next.contextLimits[key] = parsed.value;
+        }
+        writeState(next);
+        notifyResult(ctx);
+        return;
+      }
+
       if (!raw || raw.toLowerCase() === "status") {
-        updateStatus(ctx);
+        refreshStatus(ctx);
         ctx.ui.notify(describe(ctx), "info");
         return;
       }
@@ -211,61 +494,254 @@ export default function maxoutExtension(pi: ExtensionAPI): void {
         return;
       }
 
+      // Dynamic auto toggle (also the meaning of a bare "auto"). Enabling it
+      // must remove any saved fixed default for this model — otherwise the
+      // saved default would keep winning in effectiveOverride and "auto"
+      // would silently stay off. `/maxout save auto` lands here too.
+      if (valueRaw.toLowerCase() === "auto") {
+        const loaded = readState();
+        const next = normalizeState(loaded.state);
+        next.auto = true;
+        delete next.defaults[key];
+        writeState(next);
+        sessionOverrides.delete(key);
+        lastPatch.delete(key);
+        notified.delete(`boost:${key}:0`);
+        clearBoostNotifications(key);
+        notifyResult(ctx);
+        return;
+      }
+
       const parsed = parseTokenSpec(valueRaw, model);
       if (parsed.kind === "error") {
         ctx.ui.notify(parsed.message, "warning");
         return;
       }
       if (parsed.kind === "status") {
-        updateStatus(ctx);
+        refreshStatus(ctx);
         ctx.ui.notify(describe(ctx), "info");
         return;
       }
+      if (parsed.kind === "auto") return; // handled by the dynamic toggle branch above
 
       lastPatch.delete(key);
 
       if (persist) {
         const loaded = readState();
         const next = normalizeState(loaded.state);
-        if (parsed.kind === "auto") delete next.defaults[key];
-        else next.defaults[key] = parsed.value;
+        next.defaults[key] = parsed.value;
         const backupPath = writeState(next);
         sessionOverrides.delete(key);
         notifyResult(ctx, backupPath);
         return;
       }
 
-      if (parsed.kind === "auto") sessionOverrides.delete(key);
-      else sessionOverrides.set(key, parsed.value);
+      sessionOverrides.set(key, parsed.value);
       notifyResult(ctx);
     },
   });
 
   pi.on("session_start", (event, ctx) => {
-    // Session overrides survive /reload but not a new/resumed/forked session.
+    // Transient request/compaction state never survives a reload or session switch.
+    currentAttempt = null;
+    providerSizingSuspended = false;
+    compacting = false;
+    // Session-scoped settings survive /reload but not new/resumed/forked sessions.
     if (event.reason !== "reload") {
       sessionOverrides.clear();
       lastPatch.clear();
+      lastInputEstimate.clear();
+      marginBoosts.clear();
+      lastCompactionAttempt.clear();
+      notified.clear();
     }
-    updateStatus(ctx);
+    refreshStatus(ctx);
   });
 
   pi.on("model_select", (_event, ctx) => {
-    updateStatus(ctx);
+    refreshStatus(ctx);
   });
 
+  pi.on("thinking_level_select", (_event, ctx) => {
+    refreshStatus(ctx);
+  });
+
+  pi.on("session_before_compact", (_event, _ctx) => {
+    // Auto/overflow compaction can happen while the agent is active, so idle
+    // state alone cannot identify its summary request.
+    providerSizingSuspended = true;
+    currentAttempt = null;
+  });
+
+  pi.on("session_compact", (_event, ctx) => {
+    providerSizingSuspended = false;
+    // Compaction changed the context: discard stale pre-compaction status data.
+    const key = modelKey(ctx.model);
+    if (key) {
+      lastInputEstimate.delete(key);
+      lastPatch.delete(key);
+    }
+    refreshStatus(ctx);
+  });
+
+  pi.on("turn_end", (_event, ctx) => {
+    refreshStatus(ctx);
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
+    currentAttempt = null;
+    providerSizingSuspended = false;
+    maybeCompactForHeadroom(ctx)
+      .catch(() => {
+        /* compaction failures must not crash the settled handler */
+      })
+      .finally(() => refreshStatus(ctx));
+  });
+
+  pi.on("before_agent_start", async (_event, ctx) => {
+    // Await compaction for any selected-mode headroom shortfall, urgent or not,
+    // so the summary request cannot race the main provider request.
+    try {
+      await maybeCompactForHeadroom(ctx);
+    } catch {
+      /* never block the turn on compaction housekeeping */
+    }
+    refreshStatus(ctx);
+  });
+
+  // Per-request dynamic budgeting. Runs after Pi built the final payload, so
+  // tool schemas and all message content are observable here.
   pi.on("before_provider_request", (event, ctx) => {
-    const current = effectiveOverride(ctx.model);
-    if (!current.key || !current.value) return undefined;
+    const model = ctx.model;
+    const key = modelKey(model);
+    if (!model || !key) return undefined;
 
-    const result = patchMaxTokensPayload(event.payload, current.value, ctx.model);
-    lastPatch.set(current.key, {
-      cap: current.value,
-      field: result.field,
-      reason: result.reason,
+    const { state } = readState();
+    const overrideValue = effectiveOverride(key, state);
+    if (!overrideValue && !state.auto) return undefined; // fully manual/provider default
+
+    const payload: unknown = event.payload;
+    // Tool-less active main requests are sized. Idle summaries and active
+    // auto/overflow-compaction summaries retain Pi core's own budgets.
+    if (providerSizingSuspended || shouldSkipPayload(payload, ctx.isIdle())) return undefined;
+
+    const contextLimit = resolveContextLimit(model, state);
+    if (!contextLimit) return undefined; // unknown window → fail open like v1
+
+    const usageEstimate = ctx.getContextUsage()?.tokens ?? null;
+    const payloadEstimate = estimatePayloadInputTokens(payload as Record<string, unknown>);
+    const inputEstimate = combineInputEstimates(usageEstimate, payloadEstimate);
+    if (inputEstimate === null) return undefined;
+    lastInputEstimate.set(key, inputEstimate);
+
+    const decision = resolveRequestCap({
+      mode: overrideValue ? "override" : "auto",
+      requestedOverride: overrideValue ?? undefined,
+      contextLimit,
+      inputTokens: inputEstimate,
+      thinkingLevel: ctx.thinkingLevel,
+      marginTokens: state.safetyMarginTokens,
+      marginBoost: marginBoosts.get(key) ?? 0,
+      customTargets: state.targets,
+      modelMaxTokens: model.maxTokens,
     });
-    updateStatus(ctx);
 
-    return result.changed ? result.payload : undefined;
+    if (decision.exhausted || decision.cap === null) {
+      currentAttempt = null;
+      lastPatch.delete(key);
+      notifyOnce(
+        ctx,
+        `exhausted:${key}`,
+        `input ~${formatK(inputEstimate)} already fills the ${formatK(contextLimit)}-token window — no output budget left. Compaction needed; request left untouched.`,
+      );
+      refreshStatus(ctx);
+      return undefined;
+    }
+
+    const result = patchMaxTokensPayload(payload, decision.cap, model);
+    let finalPayload: unknown = result.payload;
+    let field = result.field;
+
+    // A thinking budget is meaningful only after the completion cap itself was
+    // patched. Never turn an unsupported max-token API into a partially sized
+    // request by changing only thinking_token_budget.
+    if (result.changed) {
+      const thinkingResult = patchThinkingBudgetPayload(finalPayload, decision.cap, ctx.thinkingLevel);
+      if (thinkingResult.changed) finalPayload = thinkingResult.payload;
+      field = field ?? thinkingResult.field;
+    }
+
+    // Only successfully max-token-patched requests participate in learning.
+    currentAttempt = result.changed ? { key, learned: false, streamStarted: false } : null;
+    lastPatch.set(key, {
+      cap: decision.cap,
+      field: result.changed ? field : null,
+      reason: result.changed ? decision.reason : result.reason ?? "unsupported-payload",
+      clamped: decision.clamped,
+      degraded: decision.degraded,
+    });
+
+    if (decision.degraded) {
+      notifyOnce(
+        ctx,
+        `degraded:${key}`,
+        `context nearly full: maxout reduced to ${formatK(decision.cap)} (full safety margin could not fit).`,
+      );
+    } else if (decision.clamped) {
+      notifyOnce(
+        ctx,
+        `clamped:${key}:${decision.cap}`,
+        `${ctx.thinkingLevel} target exceeded available headroom — clamped maxout to ${formatK(decision.cap)}.`,
+        "info",
+      );
+    }
+
+    refreshStatus(ctx);
+    return result.changed ? finalPayload : undefined;
+  });
+
+  // Keep the attempt alive across the 200 response event; streaming begins
+  // only when message_update arrives.
+  pi.on("message_update", (_event, ctx) => {
+    const key = modelKey(ctx.model);
+    if (key && currentAttempt?.key === key) currentAttempt.streamStarted = true;
+  });
+
+  // A pre-stream HTTP rejection can teach one larger margin. The later
+  // assistant error for the same attempt sees learned=true and cannot stack it.
+  pi.on("after_provider_response", (event, ctx) => {
+    const key = modelKey(ctx.model);
+    if (!key || currentAttempt?.key !== key) return;
+    if (event.status === 400 || event.status === 413) {
+      boostMargin(ctx, key);
+      refreshStatus(ctx);
+    }
+  });
+
+  pi.on("message_end", (event, ctx) => {
+    const message = event.message;
+    if (message.role !== "assistant") return;
+    const key = modelKey(ctx.model);
+    if (!key) return;
+
+    if (
+      currentAttempt?.key === key &&
+      message.stopReason === "error" &&
+      typeof message.errorMessage === "string" &&
+      isContextOverflow(message as Parameters<typeof isContextOverflow>[0], ctx.model?.contextWindow ?? 0)
+    ) {
+      if (!currentAttempt.streamStarted) boostMargin(ctx, key);
+    } else if (message.stopReason !== "error" && message.usage) {
+      const usage = message.usage;
+      const usageTokens =
+        usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+      if (usageTokens > 0 && (marginBoosts.get(key) ?? 0) !== 0) {
+        marginBoosts.set(key, 0);
+        clearBoostNotifications(key);
+      }
+    }
+
+    if (currentAttempt?.key === key) currentAttempt = null;
+    refreshStatus(ctx);
   });
 }
