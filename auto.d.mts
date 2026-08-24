@@ -54,6 +54,7 @@ export function resolveRequestCap(options: {
   marginBoost?: unknown;
   customTargets?: Record<string, unknown> | null;
   modelMaxTokens?: unknown;
+  adaptiveTarget?: unknown;
 }): AutoCapResult & { margin: number; reason: string };
 
 export function formatK(value: unknown): string;

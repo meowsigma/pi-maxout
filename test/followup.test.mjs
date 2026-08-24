@@ -30,15 +30,15 @@ beforeEach(async () => {
 });
 
 test("real 200 -> stream update -> overflow does not learn a margin boost", () => {
-  h.setThinkingLevel("high");
-  h.ctx.getContextUsage = () => ({ tokens: 97000, contextWindow: LIMIT, percent: 74 });
-  assert.equal(h.emit.before_provider_request({ payload: payload() }).max_tokens, 32000);
+  h.setThinkingLevel("high"); // cold-start target 16000
+  h.ctx.getContextUsage = () => ({ tokens: 114000, contextWindow: LIMIT, percent: 87 });
+  assert.equal(h.emit.before_provider_request({ payload: payload() }).max_tokens, LIMIT - 114000 - 2048);
   h.emit.after_provider_response({ status: 200, headers: {} });
   h.emit.message_update({ message: { role: "assistant", content: [{ type: "text", text: "partial" }] } });
   h.emit.message_end({
     message: { role: "assistant", stopReason: "error", errorMessage: "maximum context length exceeded" },
   });
-  assert.equal(h.emit.before_provider_request({ payload: payload() }).max_tokens, 32000);
+  assert.equal(h.emit.before_provider_request({ payload: payload() }).max_tokens, LIMIT - 114000 - 2048);
 });
 
 test("active auto-compaction request is suspended even though agent is not idle", () => {

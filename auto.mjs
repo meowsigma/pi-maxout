@@ -287,6 +287,7 @@ export function resolveRequestCap({
   marginBoost = 0,
   customTargets,
   modelMaxTokens,
+  adaptiveTarget,
 }) {
   const limit = safeInt(contextLimit);
   if (limit === null) {
@@ -294,10 +295,15 @@ export function resolveRequestCap({
   }
 
   const margin = effectiveMargin(marginTokens, marginBoost, limit);
-  let target =
-    mode === "override"
-      ? Math.max(MIN_CAP_TOKENS, Math.floor(Number(requestedOverride) || 0))
-      : resolveTargetTokens(thinkingLevel, customTargets);
+  let target;
+  if (mode === "override") {
+    target = Math.max(MIN_CAP_TOKENS, Math.floor(Number(requestedOverride) || 0));
+  } else {
+    // Adaptive profiles supply their own learned cap target; the static
+    // thinking-level table remains the fallback when no profile applies.
+    const learned = safeInt(adaptiveTarget);
+    target = learned ?? resolveTargetTokens(thinkingLevel, customTargets);
+  }
 
   // Auto targets honor what the model actually advertises for output; catalogs
   // sometimes advertise larger targets than the deployment serves.

@@ -40,6 +40,14 @@ import {
   patchThinkingBudgetPayload,
 } from "./core.mjs";
 import {
+  decayAdaptiveProfile,
+  normalizeAdaptiveProfile,
+  observeAdaptiveCompaction,
+  observeAdaptiveOutput,
+  profileKey,
+} from "./adaptive.mjs";
+import type { AdaptiveProfile } from "./adaptive.mjs";
+import {
   MAX_MARGIN_BOOST_TOKENS,
   MIN_MARGIN_TOKENS,
   combineInputEstimates,
@@ -78,7 +86,13 @@ const lastCompactionAttempt = new Map<string, number>();
 let compacting = false;
 /** Prevent sizing Pi's own compaction-summary provider request. */
 let providerSizingSuspended = false;
-type SizedAttempt = { key: string; learned: boolean; streamStarted: boolean };
+type SizedAttempt = {
+  key: string;
+  learned: boolean;
+  streamStarted: boolean;
+  /** Set only for successfully patched AUTO requests; fixed overrides never learn. */
+  adaptive?: { profileId: string };
+};
 /** The main request currently awaiting/consuming a provider response. */
 let currentAttempt: SizedAttempt | null = null;
 
@@ -167,6 +181,89 @@ function desiredOutputTarget(
   return Number.isSafeInteger(declared) && declared > 0 ? Math.min(target, declared) : target;
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive auto learning (schema v3 profiles)
+// ---------------------------------------------------------------------------
+
+type LoadedAdaptive = {
+  id: string;
+  profile: AdaptiveProfile;
+};
+
+/**
+ * Resolve (and lazily decay) the active auto profile for this model+level.
+ * Returns null outside dynamic auto mode — fixed overrides never participate.
+ * Callers persist via persistAdaptiveProfile only when something changed.
+ */
+function loadAdaptiveProfile(
+  key: string,
+  state: StateShape,
+  thinkingLevel: string | null | undefined,
+): LoadedAdaptive | null {
+  if (!state.auto || effectiveOverride(key, state)) return null;
+  const id = profileKey(key, thinkingLevel);
+  const stored = state.adaptiveProfiles[id];
+  let profile = normalizeAdaptiveProfile(stored, { level: thinkingLevel });
+  const decayed = decayAdaptiveProfile(profile, Date.now());
+  if (decayed === null) {
+    // Profiles older than 90 days are dropped entirely (cold-start restart).
+    profile = normalizeAdaptiveProfile(undefined, { level: thinkingLevel });
+  } else if (decayed !== profile) {
+    profile = decayed;
+  }
+  return { id, profile };
+}
+
+function sameProfile(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/** Persist the profile atomically, but only when its content actually changed. */
+function persistAdaptiveProfile(state: StateShape, loaded: LoadedAdaptive): void {
+  persistObservedProfile(state, loaded.id, state.adaptiveProfiles[loaded.id], loaded.profile);
+}
+
+/** A profile with no observations yet carries no information — don't materialize it. */
+function isEmptyLearning(profile: AdaptiveProfile): boolean {
+  return (
+    profile.seq === 0 &&
+    profile.outputs.length === 0 &&
+    profile.pressureCount === 0 &&
+    profile.windowResponses === 0 &&
+    profile.capTarget === profile.capFloor
+  );
+}
+
+function persistObservedProfile(
+  state: StateShape,
+  id: string,
+  previousStored: unknown,
+  next: AdaptiveProfile,
+): void {
+  if (previousStored !== undefined && sameProfile(previousStored, next)) return;
+  if (previousStored === undefined && isEmptyLearning(next)) return;
+  writeState({ ...state, adaptiveProfiles: { ...state.adaptiveProfiles, [id]: next } });
+}
+
+/** Record downshift pressure after a SUCCESSFUL maxout-initiated compaction. */
+function recordCompactionPressure(
+  _ctx: ExtensionContext,
+  key: string,
+  thinkingLevel: string | null | undefined,
+): void {
+  try {
+    const { state } = readState();
+    if (!state.auto || effectiveOverride(key, state)) return; // fixed mode never learns
+    const id = profileKey(key, thinkingLevel);
+    const stored = state.adaptiveProfiles[id];
+    const profile = normalizeAdaptiveProfile(stored, { level: thinkingLevel });
+    const next = observeAdaptiveCompaction(profile, { nowMs: Date.now() });
+    persistObservedProfile(state, id, stored, next);
+  } catch {
+    /* pressure bookkeeping must never break compaction cleanup */
+  }
+}
+
 function notifyOnce(
   ctx: ExtensionContext,
   dedupeKey: string,
@@ -203,6 +300,7 @@ function refreshStatus(ctx: ExtensionContext): void {
   const { state } = readState();
   const overrideValue = effectiveOverride(key, state);
   const contextLimit = resolveContextLimit(model, state);
+  const loadedAdaptive = overrideValue ? null : loadAdaptiveProfile(key, state, ctx.thinkingLevel);
 
   // Preview of what the next request would request (same math as the live path).
   let cap: number | null = null;
@@ -223,6 +321,7 @@ function refreshStatus(ctx: ExtensionContext): void {
       marginBoost: marginBoosts.get(key) ?? 0,
       customTargets: state.targets,
       modelMaxTokens: model.maxTokens,
+      adaptiveTarget: loadedAdaptive?.profile.capTarget,
     });
     cap = decision.exhausted ? null : decision.cap;
     if (decision.clamped) flags.push("clamped");
@@ -249,12 +348,29 @@ function describe(ctx: ExtensionContext): string {
   else lines.push(`${model.provider}/${model.id} (unkeyed)`);
 
   const overrideValue = key ? effectiveOverride(key, state) : null;
+  const loadedAdaptive = key && !overrideValue && state.auto ? loadAdaptiveProfile(key, state, ctx.thinkingLevel) : null;
+  const autoCap = loadedAdaptive
+    ? Math.min(
+        loadedAdaptive.profile.capTarget,
+        Number.isSafeInteger(Number(model.maxTokens)) && Number(model.maxTokens) > 0 ? Number(model.maxTokens) : Infinity,
+      )
+    : desiredOutputTarget(model, key ?? "", state, ctx.thinkingLevel);
   const modeLabel = overrideValue
     ? `fixed ${formatTokens(overrideValue)} (${sessionOverrides.has(key ?? "") ? "session" : "saved"})`
     : state.auto
-      ? `auto-dynamic (target ${formatK(desiredOutputTarget(model, key ?? "", state, ctx.thinkingLevel))} @ ${ctx.thinkingLevel})`
+      ? `auto-adaptive (cap ${formatK(autoCap)} @ ${ctx.thinkingLevel})`
       : "provider default (dynamic off)";
   lines.push(`mode: ${modeLabel}`);
+
+  if (loadedAdaptive) {
+    const p = loadedAdaptive.profile;
+    const declaredMax = Number(model.maxTokens);
+    const reserve = Number.isSafeInteger(declaredMax) && declaredMax > 0 ? Math.min(p.reservationTarget, declaredMax) : p.reservationTarget;
+    lines.push(
+      `learning: reserve ${formatK(reserve)} • ${p.outputs.length} recent outputs` +
+        (p.pressureCount > 0 ? ` • compaction pressure ${p.pressureCount}` : ""),
+    );
+  }
 
   const limit = resolveContextLimit(model, state);
   lines.push(
@@ -345,7 +461,24 @@ async function maybeCompactForHeadroom(ctx: ExtensionContext): Promise<void> {
   const tokens = usage?.tokens;
   if (!tokens) return; // unknown (fresh/just-compacted) — nothing to act on
 
-  const target = desiredOutputTarget(model, key, state, ctx.thinkingLevel);
+  // Dual targets: fixed overrides keep their cap as the compaction trigger;
+  // dynamic auto mode justifies compaction against the learned RESERVATION,
+  // never the (larger) learned cap.
+  let target: number;
+  let learnOnComplete = false;
+  let loadedAdaptive: LoadedAdaptive | null = null;
+  if (overrideValue) {
+    target = overrideValue;
+  } else {
+    loadedAdaptive = loadAdaptiveProfile(key, state, ctx.thinkingLevel);
+    if (!loadedAdaptive) return;
+    persistAdaptiveProfile(state, loadedAdaptive);
+    const declaredMax = Number(model.maxTokens);
+    const ceiling =
+      Number.isSafeInteger(declaredMax) && declaredMax > 0 ? declaredMax : Number.MAX_SAFE_INTEGER;
+    target = Math.min(loadedAdaptive.profile.reservationTarget, ceiling);
+    learnOnComplete = true;
+  }
   const margin = effectiveMargin(state.safetyMarginTokens, marginBoosts.get(key) ?? 0, contextLimit);
   const remaining = contextLimit - tokens - margin;
 
@@ -383,9 +516,43 @@ async function maybeCompactForHeadroom(ctx: ExtensionContext): Promise<void> {
     });
   } finally {
     if (!completed) lastCompactionAttempt.delete(key); // failed compaction may retry immediately
+    else if (learnOnComplete) recordCompactionPressure(ctx, key, ctx.thinkingLevel);
     compacting = false;
     providerSizingSuspended = false;
     refreshStatus(ctx);
+  }
+}
+
+/**
+ * Apply at most one adaptive output transition per attempt, attributed only
+ * to the successfully patched AUTO request that just completed.
+ */
+function learnAdaptiveOutcome(
+  ctx: ExtensionContext,
+  key: string,
+  message: { stopReason?: unknown; usage?: unknown },
+): void {
+  const attempt = currentAttempt;
+  if (!attempt || attempt.key !== key || attempt.learned || !attempt.adaptive) return;
+  attempt.learned = true;
+
+  const truncated = message.stopReason === "length"; // explicit length/token-limit stop
+  const rawOutput = Number((message.usage as { output?: unknown } | undefined)?.output);
+  const outputTokens = Number.isSafeInteger(rawOutput) && rawOutput > 0 ? rawOutput : null;
+  // Missing usage still processes a trustworthy length stop (no history update).
+  if (!truncated && outputTokens === null) return;
+
+  try {
+    const { state } = readState();
+    const id = attempt.adaptive.profileId;
+    const stored = state.adaptiveProfiles[id];
+    const profile = normalizeAdaptiveProfile(stored, {
+      level: id.slice(id.lastIndexOf(":") + 1),
+    });
+    const next = observeAdaptiveOutput(profile, { outputTokens, truncated, nowMs: Date.now() });
+    persistObservedProfile(state, id, stored, next);
+  } catch {
+    /* learning must never break the response lifecycle */
   }
 }
 
@@ -414,6 +581,8 @@ export default function maxoutExtension(pi: ExtensionAPI): void {
         "margin",
         "limit",
         "limit clear",
+        "learn",
+        "learn reset",
       ];
       const value = String(prefix ?? "").trimStart().toLowerCase();
       const matches = options.filter((option) => option.startsWith(value));
@@ -477,6 +646,40 @@ export default function maxoutExtension(pi: ExtensionAPI): void {
         }
         writeState(next);
         notifyResult(ctx);
+        return;
+      }
+
+      if (/^learn(?:\s+\S+)?$/i.test(raw)) {
+        const sub = raw.split(/\s+/)[1];
+        if (!sub) {
+          const { state } = readState();
+          const count = Object.keys(state.adaptiveProfiles).length;
+          ctx.ui.notify(
+            `pi-maxout: ${count} learned auto budget(s). Usage: /maxout learn reset`,
+            "info",
+          );
+          return;
+        }
+        if (sub.toLowerCase() !== "reset") {
+          ctx.ui.notify(
+            "Usage: /maxout learn reset — clears learned auto budgets; fixed caps, limits, and margins are untouched.",
+            "warning",
+          );
+          return;
+        }
+        const loaded = readState();
+        const next = normalizeState(loaded.state);
+        const cleared = Object.keys(next.adaptiveProfiles).length;
+        next.adaptiveProfiles = {};
+        writeState(next);
+        lastPatch.delete(key);
+        ctx.ui.notify(
+          cleared > 0
+            ? `pi-maxout: cleared ${cleared} learned auto budget(s). Auto mode restarts from cold-start targets.`
+            : "pi-maxout: no learned auto budgets to clear.",
+          "info",
+        );
+        refreshStatus(ctx);
         return;
       }
 
@@ -644,6 +847,7 @@ export default function maxoutExtension(pi: ExtensionAPI): void {
       marginBoost: marginBoosts.get(key) ?? 0,
       customTargets: state.targets,
       modelMaxTokens: model.maxTokens,
+      adaptiveTarget: overrideValue ? undefined : loadAdaptiveProfile(key, state, ctx.thinkingLevel)?.profile.capTarget,
     });
 
     if (decision.exhausted || decision.cap === null) {
@@ -672,7 +876,16 @@ export default function maxoutExtension(pi: ExtensionAPI): void {
     }
 
     // Only successfully max-token-patched requests participate in learning.
-    currentAttempt = result.changed ? { key, learned: false, streamStarted: false } : null;
+    const adaptiveAttempt =
+      result.changed && !overrideValue ? loadAdaptiveProfile(key, state, ctx.thinkingLevel) : null;
+    currentAttempt = result.changed
+      ? {
+          key,
+          learned: false,
+          streamStarted: false,
+          ...(adaptiveAttempt ? { adaptive: { profileId: adaptiveAttempt.id } } : {}),
+        }
+      : null;
     lastPatch.set(key, {
       cap: decision.cap,
       field: result.changed ? field : null,
@@ -731,14 +944,17 @@ export default function maxoutExtension(pi: ExtensionAPI): void {
       isContextOverflow(message as Parameters<typeof isContextOverflow>[0], ctx.model?.contextWindow ?? 0)
     ) {
       if (!currentAttempt.streamStarted) boostMargin(ctx, key);
-    } else if (message.stopReason !== "error" && message.usage) {
+    } else if (message.stopReason !== "error") {
       const usage = message.usage;
-      const usageTokens =
-        usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
-      if (usageTokens > 0 && (marginBoosts.get(key) ?? 0) !== 0) {
-        marginBoosts.set(key, 0);
-        clearBoostNotifications(key);
+      if (usage) {
+        const usageTokens =
+          usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+        if (usageTokens > 0 && (marginBoosts.get(key) ?? 0) !== 0) {
+          marginBoosts.set(key, 0);
+          clearBoostNotifications(key);
+        }
       }
+      learnAdaptiveOutcome(ctx, key, message);
     }
 
     if (currentAttempt?.key === key) currentAttempt = null;

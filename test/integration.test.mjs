@@ -45,17 +45,17 @@ test("regression scenario: usage-based input 67347 gets a safe max_tokens patch"
   const payload = vllmPayload();
   const out = h.emit.before_provider_request({ payload });
   assert.ok(out, "payload must be replaced");
-  assert.equal(out.max_tokens, 16000); // default thinking level -> normal target
+  assert.equal(out.max_tokens, 8000); // default thinking level -> adaptive cold start
   assert.ok(67347 + out.max_tokens <= LIMIT);
-  assert.match(h.ui.status, /input 67\.3K • maxout 16\.0K • context 131\.1K/);
+  assert.match(h.ui.status, /input 67\.3K • maxout 8\.0K • context 131\.1K/);
 });
 
-test("xhigh target requests 56.0K when it fits", () => {
+test("xhigh cold-start target requests 32.0K when it fits", () => {
   h.setThinkingLevel("xhigh");
   h.ctx.getContextUsage = () => ({ tokens: 67347, contextWindow: LIMIT, percent: 51 });
   const out = h.emit.before_provider_request({ payload: vllmPayload() });
-  assert.equal(out.max_tokens, 56000);
-  assert.match(h.ui.status, /maxout 56\.0K/);
+  assert.equal(out.max_tokens, 32000);
+  assert.match(h.ui.status, /maxout 32\.0K/);
 });
 
 test("large prompt clamps safely; compaction payload untouched; exhaustion notifies", () => {
@@ -99,23 +99,24 @@ test("no-tools ACTIVE main requests are sized like any other turn", () => {
   h.ctx.getContextUsage = () => ({ tokens: 67347, contextWindow: LIMIT, percent: 51 });
   const out = h.emit.before_provider_request({ payload: vllmPayload({ withTools: false }) });
   assert.ok(out, "tool-less main request must be patched");
-  assert.equal(out.max_tokens, 16000);
+  assert.equal(out.max_tokens, 8000);
   assert.ok(67347 + out.max_tokens <= LIMIT);
 });
 
 test("pre-stream 400 boosts margin for the retried request; success resets it", () => {
-  h.setThinkingLevel("high"); // target 32000
-  h.ctx.getContextUsage = () => ({ tokens: 97000, contextWindow: LIMIT, percent: 74 });
+  h.setThinkingLevel("high"); // cold-start target 16000
+  // tight enough that the clamped budget exceeds what fits after a boost
+  h.ctx.getContextUsage = () => ({ tokens: 114000, contextWindow: LIMIT, percent: 87 });
 
   const first = h.emit.before_provider_request({ payload: vllmPayload() });
-  assert.equal(first.max_tokens, 32000);
+  assert.equal(first.max_tokens, LIMIT - 114000 - 2048); // clamped below the learned target
 
   // provider rejects pre-stream
   h.emit.after_provider_response({ status: 400, headers: {} });
 
   const second = h.emit.before_provider_request({ payload: vllmPayload() });
-  // boosted margin (2048 -> 4096) shrinks soft room: 131072 - 97000 - 4096
-  assert.equal(second.max_tokens, LIMIT - 97000 - 4096);
+  // boosted margin (2048 -> 4096) shrinks soft room: 131072 - 114000 - 4096
+  assert.equal(second.max_tokens, LIMIT - 114000 - 4096);
   assert.ok(second.max_tokens < first.max_tokens, "boosted margin must shrink the budget");
 
   // a successful assistant response resets the learner
@@ -127,28 +128,28 @@ test("pre-stream 400 boosts margin for the retried request; success resets it", 
     },
   });
   const third = h.emit.before_provider_request({ payload: vllmPayload() });
-  assert.equal(third.max_tokens, 32000);
+  assert.equal(third.max_tokens, LIMIT - 114000 - 2048);
 });
 
 test("pre-stream assistant overflow learns once and only Pi performs the retry", () => {
   globalThis.__PI_MAXOUT_TEST_OVERFLOW = true;
   h.setThinkingLevel("medium");
-  h.ctx.getContextUsage = () => ({ tokens: 115000, contextWindow: LIMIT, percent: 88 });
+  h.ctx.getContextUsage = () => ({ tokens: 122000, contextWindow: LIMIT, percent: 93 });
   const first = h.emit.before_provider_request({ payload: vllmPayload() });
-  assert.equal(first.max_tokens, LIMIT - 115000 - 2048);
+  assert.equal(first.max_tokens, LIMIT - 122000 - 2048);
 
   h.emit.message_end({
     message: { role: "assistant", stopReason: "error", errorMessage: "This model's maximum context length is 131072 tokens. However, you requested too many tokens." },
   });
 
   const second = h.emit.before_provider_request({ payload: vllmPayload() });
-  assert.equal(second.max_tokens, LIMIT - 115000 - 4096, "boosted margin shrinks the retried budget");
+  assert.equal(second.max_tokens, LIMIT - 122000 - 4096, "boosted margin shrinks the retried budget");
   // The only provider traffic here is the patched payloads handed BACK to Pi
   // via before_provider_request (first attempt + its single pre-stream retry).
   // The extension initiates no requests of its own.
   assert.deepEqual(
     h.sends.map((p) => p.max_tokens),
-    [LIMIT - 115000 - 2048, LIMIT - 115000 - 4096],
+    [LIMIT - 122000 - 2048, LIMIT - 122000 - 4096],
   );
   delete globalThis.__PI_MAXOUT_TEST_OVERFLOW;
 });
@@ -170,7 +171,7 @@ test("compaction frees context -> next request gets its full target back", () =>
   // session_compact fires; usage collapses to a compacted summary
   h.ctx.getContextUsage = () => ({ tokens: 12000, contextWindow: LIMIT, percent: 9 });
   const freed = h.emit.before_provider_request({ payload: vllmPayload() });
-  assert.equal(freed.max_tokens, 56000, "full xhigh target restored after compaction");
+  assert.equal(freed.max_tokens, 32000, "full xhigh cold-start target restored after compaction");
 });
 
 test("model/provider change recalculates the limit", () => {
@@ -185,7 +186,7 @@ test("model/provider change recalculates the limit", () => {
 test("agent_settled schedules compaction when headroom < selected target", () => {
   h.setThinkingLevel("xhigh");
   h.ctx.isIdle = () => true;
-  h.ctx.getContextUsage = () => ({ tokens: 90000, contextWindow: LIMIT, percent: 69 }); // room ~39K < 56K
+  h.ctx.getContextUsage = () => ({ tokens: 101000, contextWindow: LIMIT, percent: 77 }); // room ~28K < 32K reservation
   h.emit.agent_settled({});
   assert.equal(h.compactions.length, 1, "compaction should be scheduled");
 });
@@ -236,7 +237,7 @@ test("/maxout save auto deletes the saved default so dynamic mode actually engag
   // effectiveOverride no longer returns the saved value -> auto sizing applies.
   h.ctx.getContextUsage = () => ({ tokens: 67347, contextWindow: LIMIT, percent: 51 });
   const out = h.emit.before_provider_request({ payload: vllmPayload() });
-  assert.equal(out.max_tokens, 16000, "auto target applied, not the stale saved default");
+  assert.equal(out.max_tokens, 8000, "auto cold-start applied, not the stale saved default");
 });
 
 test("/maxout limit accepts values above the catalog window; fixed caps still reject them", async () => {
@@ -324,12 +325,12 @@ test("session_compact clears the stale input estimate and last-patch record", ()
 });
 
 test("margin learning is capped at one boost per attempt and suppressed after streaming started", () => {
-  h.setThinkingLevel("high"); // target 32K
-  h.ctx.getContextUsage = () => ({ tokens: 97000, contextWindow: LIMIT, percent: 74 });
+  h.setThinkingLevel("high"); // cold-start target 16K
+  h.ctx.getContextUsage = () => ({ tokens: 114000, contextWindow: LIMIT, percent: 87 });
   globalThis.__PI_MAXOUT_TEST_OVERFLOW = true;
 
   const first = h.emit.before_provider_request({ payload: vllmPayload() });
-  assert.equal(first.max_tokens, 32000);
+  assert.equal(first.max_tokens, LIMIT - 114000 - 2048);
 
   // Streaming starts, then an overflow error surfaces post-stream:
   // suppression means NO margin learning from this attempt.
@@ -338,7 +339,7 @@ test("margin learning is capped at one boost per attempt and suppressed after st
     message: { role: "assistant", stopReason: "error", errorMessage: "maximum context length exceeded" },
   });
   let again = h.emit.before_provider_request({ payload: vllmPayload() });
-  assert.equal(again.max_tokens, 32000, "post-stream overflow must not learn");
+  assert.equal(again.max_tokens, LIMIT - 114000 - 2048, "post-stream overflow must not learn");
 
   // Fresh attempt without streaming: pre-stream rejection boosts exactly once,
   // even if several failure events arrive for the same attempt.
@@ -347,7 +348,7 @@ test("margin learning is capped at one boost per attempt and suppressed after st
     message: { role: "assistant", stopReason: "error", errorMessage: "maximum context length exceeded" },
   }); // same attempt -> must NOT stack a second boost
   again = h.emit.before_provider_request({ payload: vllmPayload() });
-  assert.equal(again.max_tokens, LIMIT - 97000 - 4096, "exactly one boost step applied");
+  assert.equal(again.max_tokens, LIMIT - 114000 - 4096, "exactly one boost step applied");
   delete globalThis.__PI_MAXOUT_TEST_OVERFLOW;
 });
 
@@ -390,15 +391,15 @@ test("xhigh/max rewrites an existing numeric thinking_token_budget to min(50000,
   const p1 = vllmPayload();
   p1.thinking_token_budget = 60000;
   const out1 = h.emit.before_provider_request({ payload: p1 });
-  assert.equal(out1.thinking_token_budget, Math.min(50000, 56000 - 4096)); // 50000
-  assert.equal(out1.max_tokens, 56000);
+  assert.equal(out1.thinking_token_budget, Math.min(50000, 32000 - 4096)); // 27904
+  assert.equal(out1.max_tokens, 32000);
 
   // clamped cap drags the budget down with it
-  h.ctx.getContextUsage = () => ({ tokens: 97000, contextWindow: LIMIT, percent: 74 });
+  h.ctx.getContextUsage = () => ({ tokens: 100000, contextWindow: LIMIT, percent: 76 });
   const p2 = vllmPayload();
   p2.thinking_token_budget = 50000;
   const out2 = h.emit.before_provider_request({ payload: p2 });
-  const expectedCap = LIMIT - 97000 - 2048; // soft room clamps the 56K target
+  const expectedCap = LIMIT - 100000 - 2048; // soft room clamps the learned target
   assert.equal(out2.max_tokens, expectedCap);
   assert.equal(out2.thinking_token_budget, Math.min(50000, expectedCap - 4096));
 });
@@ -430,4 +431,261 @@ test("failed patches store their reason in the last-patch record", async () => {
   await h.runCommand("status");
   const text = h.ui.notifies.at(-1).message;
   assert.match(text, /not applied \(unsupported-api:totally-unknown-api\)/);
+});
+
+// ---------------------------------------------------------------------------
+// Adaptive auto feedback (v2.2.0): attribution + dual targets
+// ---------------------------------------------------------------------------
+
+function readStateFile() {
+  try {
+    return JSON.parse(fs.readFileSync(h.agentDir + "/pi-maxout.json", "utf8"));
+  } catch {
+    return {}; // nothing was ever persisted in this session
+  }
+}
+
+function writeStateFile(state) {
+  fs.writeFileSync(h.agentDir + "/pi-maxout.json", `${JSON.stringify(state, null, 2)}\n`);
+}
+
+function seedProfile(id, fields) {
+  const s = readStateFile();
+  s.adaptiveProfiles = s.adaptiveProfiles ?? {};
+  s.adaptiveProfiles[id] = { seq: 0, outputs: [], pressureCount: 0, windowResponses: 0, windowTruncations: 0, ...fields };
+  writeStateFile(s);
+}
+
+const KEY = "llama.cpp:qwen3-next";
+
+test("auto mode cold-starts conservatively per thinking level and learns independently", () => {
+  h.ctx.getContextUsage = () => ({ tokens: 10000, contextWindow: LIMIT, percent: 8 });
+
+  // low -> 8000; a length stop raises ONLY the low profile
+  let out = h.emit.before_provider_request({ payload: vllmPayload() });
+  assert.equal(out.max_tokens, 8000);
+  h.emit.message_end({
+    message: { role: "assistant", stopReason: "length", usage: { input: 9000, output: 500, cacheRead: 0, cacheWrite: 0 } },
+  });
+
+  // high is untouched by low's learning (cold start 16000), and rises on ITS own length stop
+  h.setThinkingLevel("high");
+  out = h.emit.before_provider_request({ payload: vllmPayload() });
+  assert.equal(out.max_tokens, 16000);
+  h.emit.message_end({
+    message: { role: "assistant", stopReason: "length", usage: { input: 9000, output: 500, cacheRead: 0, cacheWrite: 0 } },
+  });
+
+  const learned = readStateFile().adaptiveProfiles;
+  assert.equal(learned[`${KEY}:low`].capTarget, 12000);
+  assert.equal(learned[`${KEY}:low`].reservationTarget, 12000);
+  assert.equal(learned[`${KEY}:high`].capTarget, 24000);
+
+  // a different model starts cold even at the same thinking level
+  h.setThinkingLevel("high");
+  h.ctx.model = { ...MODEL, id: "other-model" };
+  const otherKey = "llama.cpp:other-model";
+  out = h.emit.before_provider_request({ payload: vllmPayload() });
+  assert.equal(out.max_tokens, 16000, "unlearned model uses its cold start");
+  assert.equal(readStateFile().adaptiveProfiles[`${KEY}:high`].capTarget, 24000);
+});
+
+test("attributable length stop raises only the next attempt's cap and persists it", () => {
+  h.ctx.getContextUsage = () => ({ tokens: 10000, contextWindow: LIMIT, percent: 8 });
+  const first = h.emit.before_provider_request({ payload: vllmPayload() });
+  assert.equal(first.max_tokens, 8000);
+
+  h.emit.message_end({
+    message: { role: "assistant", stopReason: "length", usage: { input: 9500, output: 8000, cacheRead: 0, cacheWrite: 0 } },
+  });
+  assert.equal(readStateFile().adaptiveProfiles[`${KEY}:low`].capTarget, 12000);
+
+  const second = h.emit.before_provider_request({ payload: vllmPayload() });
+  assert.equal(second.max_tokens, 12000);
+});
+
+test("successful short outputs grow reservation from p90 history without raising cap", () => {
+  seedProfile(`${KEY}:xhigh`, {
+    capTarget: 32000,
+    reservationTarget: 8000,
+    capFloor: 8000,
+    capCeiling: 56000,
+  });
+  h.setThinkingLevel("xhigh");
+  h.ctx.getContextUsage = () => ({ tokens: 10000, contextWindow: LIMIT, percent: 8 });
+  assert.equal(h.emit.before_provider_request({ payload: vllmPayload() }).max_tokens, 32000);
+
+  // two ~7K answers lift recent p90 above 6400 -> rung(1.25 * p90) = 12000
+  for (let i = 0; i < 2; i++) {
+    h.emit.message_end({
+      message: { role: "assistant", stopReason: "stop", usage: { input: 10000, output: 7000, cacheRead: 0, cacheWrite: 0 } },
+    });
+    if (i === 0) {
+      h.emit.before_provider_request({ payload: vllmPayload() }); // keep an attempt open for sample two
+    }
+  }
+  const profile = readStateFile().adaptiveProfiles[`${KEY}:xhigh`];
+  assert.equal(profile.reservationTarget, 12000);
+  assert.equal(profile.capTarget, 32000, "short successful answers never raise the cap");
+});
+
+test("compaction is driven by the reservation target, not the cap target", async () => {
+  // 32K cap with an 8K reservation: 12K of headroom must NOT compact.
+  seedProfile(`${KEY}:high`, {
+    capTarget: 32000,
+    reservationTarget: 8000,
+    capFloor: 8000,
+    capCeiling: 56000,
+  });
+  h.setThinkingLevel("high");
+  h.ctx.isIdle = () => true;
+  h.ctx.getContextUsage = () => ({ tokens: LIMIT - 2048 - 12000, contextWindow: LIMIT, percent: 89 });
+  await h.emit.agent_settled({});
+  assert.equal(h.compactions.length, 0, "12K remaining >= 8K reservation: no compaction despite 32K cap");
+
+  // Same cap but a large reservation: less room now justifies compacting.
+  seedProfile(`${KEY}:high`, {
+    capTarget: 32000,
+    reservationTarget: 32000,
+    capFloor: 8000,
+    capCeiling: 56000,
+  });
+  h.ctx.getContextUsage = () => ({ tokens: LIMIT - 2048 - 30000, contextWindow: LIMIT, percent: 75 });
+  await h.emit.agent_settled({});
+  assert.equal(h.compactions.length, 1, "30K remaining < 32K reservation: compaction scheduled");
+});
+
+test("provider ceiling bounds both the patched cap and the effective reservation", async () => {
+  h.ctx.model = { ...MODEL, maxTokens: 20000 };
+  h.setThinkingLevel("xhigh"); // cold target 32000 > provider ceiling
+  h.ctx.isIdle = () => true;
+  h.ctx.getContextUsage = () => ({ tokens: LIMIT - 2048 - 25000, contextWindow: LIMIT, percent: 79 });
+  await h.emit.agent_settled({});
+  assert.equal(h.compactions.length, 0, "25K room serves a 20K provider ceiling without compacting");
+
+  h.ctx.isIdle = () => false;
+  const out = h.emit.before_provider_request({ payload: vllmPayload() });
+  assert.equal(out.max_tokens, 20000);
+});
+
+test("two successful maxout compactions inside eight responses downshift one rung", async () => {
+  seedProfile(`${KEY}:xhigh`, {
+    capTarget: 24000,
+    reservationTarget: 24000,
+    capFloor: 8000,
+    capCeiling: 56000,
+  });
+  h.setThinkingLevel("xhigh");
+  h.ctx.isIdle = () => true;
+
+  // Compaction #1 completes (pressure opens).
+  h.ctx.getContextUsage = () => ({ tokens: LIMIT - 2048 - 10000, contextWindow: LIMIT, percent: 91 });
+  await h.emit.agent_settled({});
+  assert.equal(h.compactions.length, 1);
+  let profile = readStateFile().adaptiveProfiles[`${KEY}:xhigh`];
+  assert.equal(profile.capTarget, 24000, "one compaction alone never downshifts");
+
+  // One observed main response between compactions keeps the window alive.
+  h.ctx.isIdle = () => false;
+  h.ctx.getContextUsage = () => ({ tokens: LIMIT - 2048 - 10000, contextWindow: LIMIT, percent: 91 });
+  h.emit.before_provider_request({ payload: vllmPayload() });
+  h.emit.message_end({
+    message: { role: "assistant", stopReason: "stop", usage: { input: 100000, output: 400, cacheRead: 0, cacheWrite: 0 } },
+  });
+  h.ctx.isIdle = () => true;
+
+  // Compaction #2 arrives urgent (near-full context bypasses the cooldown)...
+  globalThis.__PI_MAXOUT_TEST_OVERFLOW = false;
+  h.ctx.compact = (options) => {
+    h.compactions.push(options);
+    options.onComplete({ ok: true });
+  };
+  h.ctx.getContextUsage = () => ({ tokens: LIMIT - 2048 - 500, contextWindow: LIMIT, percent: 99 });
+  await h.emit.agent_settled({});
+  assert.equal(h.compactions.length, 2);
+
+  profile = readStateFile().adaptiveProfiles[`${KEY}:xhigh`];
+  assert.equal(profile.capTarget, 16000, "second compaction downshifts one rung");
+  assert.equal(profile.reservationTarget, 16000);
+  assert.equal(profile.pressureCount, 0, "window clears after the downshift");
+  delete globalThis.__PI_MAXOUT_TEST_OVERFLOW;
+});
+
+test("failed maxout compactions and Pi-core compactions never create pressure", async () => {
+  seedProfile(`${KEY}:xhigh`, {
+    capTarget: 24000,
+    reservationTarget: 24000,
+    capFloor: 8000,
+    capCeiling: 56000,
+  });
+  h.setThinkingLevel("xhigh");
+  h.ctx.isIdle = () => true;
+  h.ctx.getContextUsage = () => ({ tokens: LIMIT - 2048 - 10000, contextWindow: LIMIT, percent: 91 });
+
+  // failed maxout compaction: onError instead of onComplete
+  h.ctx.compact = (options) => {
+    h.compactions.push(options);
+    options.onError(new Error("boom"));
+  };
+  await h.emit.agent_settled({});
+  let profile = readStateFile().adaptiveProfiles[`${KEY}:xhigh`];
+  assert.equal(profile.capTarget, 24000);
+  assert.equal(profile.pressureCount ?? 0, 0, "failed compactions add no pressure");
+
+  // Pi-core overflow compaction goes through session hooks, not ctx.compact
+  h.emit.session_before_compact({ reason: "overflow" });
+  h.emit.session_compact({ reason: "overflow" });
+  profile = readStateFile().adaptiveProfiles[`${KEY}:xhigh`];
+  assert.equal(profile.pressureCount ?? 0, 0, "core compactions are not maxout pressure");
+});
+
+test("fixed overrides bypass adaptive learning entirely", async () => {
+  await h.runCommand("save 16384");
+  h.ctx.getContextUsage = () => ({ tokens: 10000, contextWindow: LIMIT, percent: 8 });
+  const out = h.emit.before_provider_request({ payload: vllmPayload() });
+  assert.equal(out.max_tokens, 16384, "fixed cap behavior unchanged");
+
+  // even an explicit length stop teaches nothing in fixed mode
+  h.emit.message_end({
+    message: { role: "assistant", stopReason: "length", usage: { input: 9000, output: 15000, cacheRead: 0, cacheWrite: 0 } },
+  });
+  const profiles = readStateFile().adaptiveProfiles ?? {};
+  assert.deepEqual(Object.keys(profiles), [], "no profile may be created while a fixed override is active");
+});
+
+test("unsupported payload APIs create no attempt and learn nothing", async () => {
+  h.ctx.model = { ...MODEL, api: "totally-unknown-api" };
+  delete h.ctx.model.compat;
+  h.ctx.getContextUsage = () => ({ tokens: 10000, contextWindow: LIMIT, percent: 8 });
+  const bare = vllmPayload();
+  delete bare.max_tokens;
+  const out = h.emit.before_provider_request({ payload: bare });
+  assert.equal(out, undefined, "fails open like v2.1");
+
+  h.emit.message_end({
+    message: { role: "assistant", stopReason: "length", usage: { input: 9000, output: 9000, cacheRead: 0, cacheWrite: 0 } },
+  });
+  const profiles = readStateFile().adaptiveProfiles ?? {};
+  assert.deepEqual(Object.keys(profiles), [], "an unpatched request cannot attribute learning");
+});
+
+test("learned profiles survive session reload and fresh sessions", () => {
+  seedProfile(`${KEY}:low`, { capTarget: 24000, reservationTarget: 24000, capFloor: 8000, capCeiling: 16000 });
+  h.ctx.getContextUsage = () => ({ tokens: 10000, contextWindow: LIMIT, percent: 8 });
+
+  h.emit.session_start({ reason: "reload" });
+  let out = h.emit.before_provider_request({ payload: vllmPayload() });
+  assert.equal(out.max_tokens, 16000, "reload keeps learning (ceiling-clamped cap)");
+
+  // a brand-new session must not wipe persisted learning either
+  h.emit.session_start({ reason: "new" });
+  out = h.emit.before_provider_request({ payload: vllmPayload() });
+  assert.equal(out.max_tokens, 16000);
+
+  // one attributable observation persists a NORMALIZED copy of the entry
+  h.emit.message_end({
+    message: { role: "assistant", stopReason: "length", usage: { input: 9000, output: 2000, cacheRead: 0, cacheWrite: 0 } },
+  });
+  const storedProfile = readStateFile().adaptiveProfiles[`${KEY}:low`];
+  assert.equal(storedProfile.capTarget, 16000, "ceiling-clamped learned values are what get persisted");
 });
