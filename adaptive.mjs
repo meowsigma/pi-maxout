@@ -204,19 +204,21 @@ export function normalizeAdaptiveProfile(value, options = {}) {
   }
 
   const storedCap = snapDownToLadder(src.capTarget, { ceiling });
+  const capTarget = storedCap ?? floor;
   const storedReservation = (() => {
     const v = safePositiveInt(src.reservationTarget);
     if (v === null) return null;
     return Math.min(nearestRungAtOrAbove(v), ceiling);
   })();
+  const reservationTarget = Math.min(storedReservation ?? floor, capTarget);
 
   const updatedAtRaw = Number(src.updatedAt);
   const updatedAt =
     Number.isFinite(updatedAtRaw) && updatedAtRaw > 0 ? updatedAtRaw : undefined;
 
   return {
-    capTarget: storedCap ?? floor,
-    reservationTarget: storedReservation ?? floor,
+    capTarget,
+    reservationTarget,
     capFloor: floor,
     capCeiling: ceiling,
     outputs,

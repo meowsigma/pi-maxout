@@ -22,6 +22,12 @@
 - Adds `/maxout learn reset` (clears only learning data), learned-profile
   status reporting, installer/verifier packaging of the new modules, and
   focused deterministic plus randomized controller coverage.
+- Adds a real `/maxout off` command that clears fixed caps globally and leaves
+  provider payloads untouched across model switches.
+- Codex adapters that omit `max_output_tokens` remain untouched instead of
+  receiving a parameter their endpoint rejects.
+- Installer staging and backups now live outside `extensions/`, preventing Pi
+  from loading backup copies as duplicate maxout extensions.
 
 ## 2.1.0
 

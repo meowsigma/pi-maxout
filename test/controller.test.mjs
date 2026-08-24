@@ -85,6 +85,15 @@ test("normalizeAdaptiveProfile clamps learned values to ladder and ceiling", () 
   assert.deepEqual(many.outputs, [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
 });
 
+test("normalization never permits reservation above cap", () => {
+  const p = normalizeAdaptiveProfile(
+    { capTarget: 8000, reservationTarget: 32000, capFloor: 8000, capCeiling: 56000 },
+    { level: "low" },
+  );
+  assert.equal(p.capTarget, 8000);
+  assert.equal(p.reservationTarget, 8000);
+});
+
 test("attributable length stop raises both cap and reservation exactly one rung", () => {
   let p = normalizeAdaptiveProfile(undefined, { level: "low" });
   p = observeAdaptiveOutput(p, { truncated: true, nowMs: NOW });

@@ -9,5 +9,5 @@
     "types": ["node"],
     "resolveJsonModule": true
   },
-  "include": ["index.ts", "auto.d.mts", "core.d.mts"]
+  "include": ["index.ts", "adaptive.d.mts", "auto.d.mts", "core.d.mts"]
 }

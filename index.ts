@@ -348,18 +348,20 @@ function describe(ctx: ExtensionContext): string {
   else lines.push(`${model.provider}/${model.id} (unkeyed)`);
 
   const overrideValue = key ? effectiveOverride(key, state) : null;
-  const learnedProfile =
-    key && !overrideValue && state.auto
-      ? (state.adaptiveProfiles[profileKey(key, ctx.thinkingLevel)] ?? null)
-      : null;
+  const activeAdaptive =
+    key && !overrideValue && state.auto ? loadAdaptiveProfile(key, state, ctx.thinkingLevel) : null;
+  const learnedProfile = activeAdaptive
+    ? (state.adaptiveProfiles[activeAdaptive.id] ?? null)
+    : null;
   const hasLearnedData =
     learnedProfile !== null && (learnedProfile.seq > 0 || learnedProfile.outputs.length > 0);
-  const autoCap = hasLearnedData
-    ? Math.min(
-        learnedProfile.capTarget,
-        Number.isSafeInteger(Number(model.maxTokens)) && Number(model.maxTokens) > 0 ? Number(model.maxTokens) : Infinity,
-      )
-    : desiredOutputTarget(model, key ?? "", state, ctx.thinkingLevel);
+  const declaredMax = Number(model.maxTokens);
+  const effectiveProviderMax =
+    Number.isSafeInteger(declaredMax) && declaredMax > 0 ? declaredMax : Infinity;
+  const autoCap = Math.min(
+    activeAdaptive?.profile.capTarget ?? desiredOutputTarget(model, key ?? "", state, ctx.thinkingLevel),
+    effectiveProviderMax,
+  );
   const modeLabel = overrideValue
     ? `fixed ${formatTokens(overrideValue)} (${sessionOverrides.has(key ?? "") ? "session" : "saved"})`
     : state.auto
@@ -532,6 +534,13 @@ async function maybeCompactForHeadroom(ctx: ExtensionContext): Promise<void> {
  * Apply at most one adaptive output transition per attempt, attributed only
  * to the successfully patched AUTO request that just completed.
  */
+function isTokenLimitStop(stopReason: unknown): boolean {
+  return (
+    typeof stopReason === "string" &&
+    ["length", "max_tokens", "max_output_tokens", "token_limit"].includes(stopReason.toLowerCase())
+  );
+}
+
 function learnAdaptiveOutcome(
   ctx: ExtensionContext,
   key: string,
@@ -541,7 +550,7 @@ function learnAdaptiveOutcome(
   if (!attempt || attempt.key !== key || attempt.learned || !attempt.adaptive) return;
   attempt.learned = true;
 
-  const truncated = message.stopReason === "length"; // explicit length/token-limit stop
+  const truncated = isTokenLimitStop(message.stopReason);
   const rawOutput = Number((message.usage as { output?: unknown } | undefined)?.output);
   const outputTokens = Number.isSafeInteger(rawOutput) && rawOutput > 0 ? rawOutput : null;
   // Missing usage still processes a trustworthy length stop (no history update).
@@ -572,6 +581,7 @@ export default function maxoutExtension(pi: ExtensionAPI): void {
       const options = [
         "status",
         "auto",
+        "off",
         "16k",
         "32k",
         "64k",
@@ -699,6 +709,25 @@ export default function maxoutExtension(pi: ExtensionAPI): void {
       const valueRaw = persist ? String(saveMatch?.[1] ?? "").trim() : raw;
       if (persist && !valueRaw) {
         ctx.ui.notify("Usage: /maxout save 32k  |  /maxout save auto", "warning");
+        return;
+      }
+
+      // Full disable. Clear all persisted and session fixed caps so `off`
+      // remains off across model switches and cannot patch via an override.
+      // State is shared by all loaded copies, which also makes this fail-safe
+      // if an obsolete duplicate extension was discovered before reload.
+      if (valueRaw.toLowerCase() === "off") {
+        const loaded = readState();
+        const next = normalizeState(loaded.state);
+        next.auto = false;
+        next.defaults = {};
+        writeState(next);
+        sessionOverrides.clear();
+        currentAttempt = null;
+        lastPatch.delete(key);
+        lastInputEstimate.delete(key);
+        ctx.ui.notify("pi-maxout: off; provider payloads are untouched for every model.", "info");
+        refreshStatus(ctx);
         return;
       }
 
@@ -842,6 +871,9 @@ export default function maxoutExtension(pi: ExtensionAPI): void {
     if (inputEstimate === null) return undefined;
     lastInputEstimate.set(key, inputEstimate);
 
+    const adaptiveLoaded = overrideValue ? null : loadAdaptiveProfile(key, state, ctx.thinkingLevel);
+    if (adaptiveLoaded) persistAdaptiveProfile(state, adaptiveLoaded);
+
     const decision = resolveRequestCap({
       mode: overrideValue ? "override" : "auto",
       requestedOverride: overrideValue ?? undefined,
@@ -852,7 +884,7 @@ export default function maxoutExtension(pi: ExtensionAPI): void {
       marginBoost: marginBoosts.get(key) ?? 0,
       customTargets: state.targets,
       modelMaxTokens: model.maxTokens,
-      adaptiveTarget: overrideValue ? undefined : loadAdaptiveProfile(key, state, ctx.thinkingLevel)?.profile.capTarget,
+      adaptiveTarget: adaptiveLoaded?.profile.capTarget,
     });
 
     if (decision.exhausted || decision.cap === null) {
@@ -881,8 +913,7 @@ export default function maxoutExtension(pi: ExtensionAPI): void {
     }
 
     // Only successfully max-token-patched requests participate in learning.
-    const adaptiveAttempt =
-      result.changed && !overrideValue ? loadAdaptiveProfile(key, state, ctx.thinkingLevel) : null;
+    const adaptiveAttempt = result.changed && !overrideValue ? adaptiveLoaded : null;
     currentAttempt = result.changed
       ? {
           key,
@@ -930,7 +961,7 @@ export default function maxoutExtension(pi: ExtensionAPI): void {
   pi.on("after_provider_response", (event, ctx) => {
     const key = modelKey(ctx.model);
     if (!key || currentAttempt?.key !== key) return;
-    if (event.status === 400 || event.status === 413) {
+    if (!currentAttempt.streamStarted && (event.status === 400 || event.status === 413)) {
       boostMargin(ctx, key);
       refreshStatus(ctx);
     }
@@ -951,7 +982,10 @@ export default function maxoutExtension(pi: ExtensionAPI): void {
       if (!currentAttempt.streamStarted) boostMargin(ctx, key);
     } else if (message.stopReason !== "error") {
       const usage = message.usage;
-      if (usage) {
+      // Only a successful response attributable to the main request we sized
+      // may reset its learned overflow margin. Summary/title responses have no
+      // currentAttempt and must not erase main-request learning.
+      if (currentAttempt?.key === key && usage) {
         const usageTokens =
           usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
         if (usageTokens > 0 && (marginBoosts.get(key) ?? 0) !== 0) {

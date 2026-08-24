@@ -5,6 +5,7 @@ const DEFAULT_STATE_MARGIN = 2048;
 const MIN_STATE_MARGIN = 1024;
 const KNOWN_TARGET_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const UNSAFE_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+const FUTURE_TIMESTAMP_TOLERANCE_MS = 5 * 60 * 1000;
 
 import { normalizeAdaptiveProfile } from "./adaptive.mjs";
 
@@ -144,6 +145,19 @@ export function normalizeState(value) {
     for (const [key, candidate] of Object.entries(src.adaptiveProfiles)) {
       if (!isRecord(candidate)) continue;
       if (typeof key !== "string" || key.length === 0 || UNSAFE_KEYS.has(key)) continue;
+      const segments = key.split(":");
+      const level = segments.at(-1);
+      // Require at least provider:model:level, a known terminal level, and no
+      // prototype-sensitive segment. Model ids may otherwise contain colons.
+      if (
+        segments.length < 3 ||
+        segments[0].length === 0 ||
+        segments.slice(1, -1).join(":").length === 0 ||
+        !KNOWN_TARGET_LEVELS.has(level) ||
+        segments.some((segment) => UNSAFE_KEYS.has(segment))
+      ) {
+        continue;
+      }
       // Entries without a single recognizable learned field are junk, not
       // merely corrupt: drop them instead of materializing empty profiles.
       const hasLearnedSignal =
@@ -152,9 +166,14 @@ export function normalizeState(value) {
         (Number.isSafeInteger(candidate.updatedAt) && candidate.updatedAt > 0) ||
         Array.isArray(candidate.outputs);
       if (!hasLearnedSignal) continue;
-      // The thinking level is the key's last colon-separated segment.
-      const level = key.slice(key.lastIndexOf(":") + 1);
-      adaptiveProfiles[key] = normalizeAdaptiveProfile(candidate, { level });
+      const normalized = normalizeAdaptiveProfile(candidate, { level });
+      if (
+        normalized.updatedAt !== undefined &&
+        normalized.updatedAt > Date.now() + FUTURE_TIMESTAMP_TOLERANCE_MS
+      ) {
+        delete normalized.updatedAt;
+      }
+      adaptiveProfiles[key] = normalized;
     }
   }
 
@@ -262,8 +281,17 @@ export function patchMaxTokensPayload(payload, cap, model) {
   const api = typeof model?.api === "string" ? model.api : "";
 
   switch (api) {
-    case "openai-responses":
     case "openai-codex-responses":
+      // Codex adapters intentionally omit max_output_tokens for endpoints that
+      // reject it. Never invent a parameter the final adapter did not choose.
+      return {
+        payload,
+        changed: false,
+        field: null,
+        reason: "adapter-omitted-max-output-tokens",
+      };
+
+    case "openai-responses":
     case "azure-openai-responses":
       return patchRoot(payload, "max_output_tokens", cap);
 

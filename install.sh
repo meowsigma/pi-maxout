@@ -5,7 +5,10 @@ SRC_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
 EXTENSIONS_DIR="$AGENT_DIR/extensions"
 DEST="$EXTENSIONS_DIR/pi-maxout"
-STAGE="$EXTENSIONS_DIR/.pi-maxout-stage-$$"
+# Never place a stage or backup containing index.ts under extensions/: Pi's
+# recursive discovery would load it as a second live extension.
+STAGE="$AGENT_DIR/.pi-maxout-stage-$$"
+BACKUPS_DIR="$AGENT_DIR/backups/pi-maxout"
 BACKUP=""
 COMMITTED=0
 
@@ -28,7 +31,7 @@ echo "Running bundled tests..."
   node --experimental-strip-types --test
 )
 
-mkdir -p "$EXTENSIONS_DIR" "$STAGE"
+mkdir -p "$EXTENSIONS_DIR" "$BACKUPS_DIR" "$STAGE"
 cp "$SRC_DIR/index.ts" "$STAGE/index.ts"
 cp "$SRC_DIR/core.mjs" "$STAGE/core.mjs"
 cp "$SRC_DIR/core.d.mts" "$STAGE/core.d.mts"
@@ -39,7 +42,7 @@ cp "$SRC_DIR/adaptive.d.mts" "$STAGE/adaptive.d.mts"
 cp "$SRC_DIR/README.md" "$STAGE/README.md"
 
 if [[ -e "$DEST" ]]; then
-  BACKUP="${DEST}.backup-$(date +%Y%m%d-%H%M%S)-$$"
+  BACKUP="$BACKUPS_DIR/pi-maxout-$(date +%Y%m%d-%H%M%S)-$$"
   mv "$DEST" "$BACKUP"
 fi
 
@@ -58,6 +61,7 @@ Restart Pi or run /reload, then use:
   /maxout 32k
   /maxout save 32k
   /maxout auto
+  /maxout off
   /maxout margin 4096
   /maxout limit 131072
 MSG

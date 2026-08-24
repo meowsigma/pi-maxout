@@ -79,6 +79,16 @@ test("adds max_output_tokens for Responses APIs", () => {
   assert.equal(result.payload.max_output_tokens, 8192);
 });
 
+test("does not invent max_output_tokens for Codex when its adapter omitted the field", () => {
+  const input = { model: "gpt-5.6-terra", input: [] };
+  const model = { ...localModel, api: "openai-codex-responses" };
+  const result = patchMaxTokensPayload(input, 8192, model);
+  assert.equal(result.changed, false);
+  assert.equal(result.field, null);
+  assert.equal(result.reason, "adapter-omitted-max-output-tokens");
+  assert.equal(result.payload, input);
+});
+
 test("patches Google nested generationConfig without losing sibling fields", () => {
   const model = { ...localModel, api: "google-generative-ai" };
   const input = { generationConfig: { temperature: 0.2 } };

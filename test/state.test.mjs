@@ -88,6 +88,8 @@ test("adaptive profiles round-trip valid learning and drop hostile data", () => 
       __proto__: { injected: 1 }, // prototype pollution attempt
       constructor: 42, // unsafe key with junk scalar
       "llama.cpp:xhigh": "not-an-object",
+      "p:m:not-a-level": { capTarget: 12000 },
+      "p:m:low:extra": { capTarget: 12000 },
     },
   });
   assert.deepEqual(Object.keys(s.adaptiveProfiles).sort(), ["llama.cpp:gpt-oss:low"]);
@@ -100,6 +102,20 @@ test("adaptive profiles round-trip valid learning and drop hostile data", () => 
   assert.ok(Array.isArray(learned.outputs));
   assert.ok(learned.outputs.length <= 12, "history must be truncated to twelve samples");
   assert.deepEqual(learned.outputs.slice(-3), [18, 19, 20], "the LATEST twelve samples are kept");
+});
+
+test("future-dated adaptive timestamps are discarded without dropping valid targets", () => {
+  const s = normalizeState({
+    adaptiveProfiles: {
+      "p:m:low": {
+        capTarget: 12000,
+        reservationTarget: 8000,
+        updatedAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
+      },
+    },
+  });
+  assert.equal(s.adaptiveProfiles["p:m:low"].capTarget, 12000);
+  assert.equal(s.adaptiveProfiles["p:m:low"].updatedAt, undefined);
 });
 
 test("normalizeState stays idempotent with adaptive profiles present", () => {

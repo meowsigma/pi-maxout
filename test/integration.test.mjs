@@ -240,6 +240,23 @@ test("/maxout save auto deletes the saved default so dynamic mode actually engag
   assert.equal(out.max_tokens, 8000, "auto cold-start applied, not the stale saved default");
 });
 
+test("/maxout off fully disables payload patching after fixed or auto mode", async () => {
+  await h.runCommand("save 32k");
+  const seeded = JSON.parse(fs.readFileSync(h.agentDir + "/pi-maxout.json", "utf8"));
+  seeded.defaults["other:model"] = 8192;
+  fs.writeFileSync(h.agentDir + "/pi-maxout.json", JSON.stringify(seeded));
+  await h.runCommand("16k");
+  await h.runCommand("off");
+
+  const raw = JSON.parse(fs.readFileSync(h.agentDir + "/pi-maxout.json", "utf8"));
+  assert.equal(raw.auto, false);
+  assert.deepEqual(raw.defaults, {}, "off clears every persisted fixed cap so model switches remain off");
+
+  h.ctx.getContextUsage = () => ({ tokens: 1000, contextWindow: LIMIT, percent: 1 });
+  assert.equal(h.emit.before_provider_request({ payload: vllmPayload() }), undefined);
+  assert.match(h.ui.status, /maxout off/);
+});
+
 test("/maxout limit accepts values above the catalog window; fixed caps still reject them", async () => {
   await h.runCommand("limit 500000"); // catalog says 131072 — catalogs lie
   const raw = JSON.parse(fs.readFileSync(h.agentDir + "/pi-maxout.json", "utf8"));
@@ -350,6 +367,37 @@ test("margin learning is capped at one boost per attempt and suppressed after st
   again = h.emit.before_provider_request({ payload: vllmPayload() });
   assert.equal(again.max_tokens, LIMIT - 114000 - 4096, "exactly one boost step applied");
   delete globalThis.__PI_MAXOUT_TEST_OVERFLOW;
+});
+
+test("post-stream HTTP errors do not learn overflow margin", () => {
+  h.setThinkingLevel("high");
+  h.ctx.getContextUsage = () => ({ tokens: 114000, contextWindow: LIMIT, percent: 87 });
+  h.emit.before_provider_request({ payload: vllmPayload() });
+  h.emit.message_update({ message: { role: "assistant", content: [] } });
+  h.emit.after_provider_response({ status: 413, headers: {} });
+
+  const next = h.emit.before_provider_request({ payload: vllmPayload() });
+  assert.equal(next.max_tokens, LIMIT - 114000 - 2048);
+});
+
+test("successful internal summary does not reset a main-attempt margin boost", () => {
+  h.setThinkingLevel("high");
+  h.ctx.getContextUsage = () => ({ tokens: 114000, contextWindow: LIMIT, percent: 87 });
+  h.emit.before_provider_request({ payload: vllmPayload() });
+  h.emit.after_provider_response({ status: 400, headers: {} });
+
+  h.emit.session_before_compact({});
+  h.emit.message_end({
+    message: {
+      role: "assistant",
+      stopReason: "stop",
+      usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 150 },
+    },
+  });
+  h.emit.session_compact({});
+
+  const next = h.emit.before_provider_request({ payload: vllmPayload() });
+  assert.equal(next.max_tokens, LIMIT - 114000 - 4096, "summary success must not erase main overflow learning");
 });
 
 test("successful response resets the boost AND its notification dedupe", () => {
@@ -502,6 +550,15 @@ test("attributable length stop raises only the next attempt's cap and persists i
 
   const second = h.emit.before_provider_request({ payload: vllmPayload() });
   assert.equal(second.max_tokens, 12000);
+});
+
+test("provider token-limit stop aliases trigger adaptive growth", () => {
+  h.ctx.getContextUsage = () => ({ tokens: 10000, contextWindow: LIMIT, percent: 8 });
+  h.emit.before_provider_request({ payload: vllmPayload() });
+  h.emit.message_end({
+    message: { role: "assistant", stopReason: "max_tokens", usage: { input: 9500, output: 8000, cacheRead: 0, cacheWrite: 0 } },
+  });
+  assert.equal(readStateFile().adaptiveProfiles[`${KEY}:low`].capTarget, 12000);
 });
 
 test("successful short outputs grow reservation from p90 history without raising cap", () => {
@@ -690,6 +747,24 @@ test("learned profiles survive session reload and fresh sessions", () => {
   assert.equal(storedProfile.capTarget, 16000, "ceiling-clamped learned values are what get persisted");
 });
 
+test("lazy decay persists before the next response observation", () => {
+  seedProfile(`${KEY}:low`, {
+    capTarget: 16000,
+    reservationTarget: 16000,
+    capFloor: 8000,
+    capCeiling: 16000,
+    outputs: [9000],
+    updatedAt: Date.now() - 15 * 24 * 60 * 60 * 1000,
+  });
+  h.ctx.getContextUsage = () => ({ tokens: 10000, contextWindow: LIMIT, percent: 8 });
+  const out = h.emit.before_provider_request({ payload: vllmPayload() });
+  assert.equal(out.max_tokens, 12000, "request uses one-rung decay");
+  h.emit.message_end({
+    message: { role: "assistant", stopReason: "stop", usage: { input: 9000, output: 500, cacheRead: 0, cacheWrite: 0 } },
+  });
+  assert.equal(readStateFile().adaptiveProfiles[`${KEY}:low`].capTarget, 12000, "observation must not resurrect stale pre-decay cap");
+});
+
 // ---------------------------------------------------------------------------
 // User controls & status (v2.2.0)
 // ---------------------------------------------------------------------------
@@ -709,12 +784,14 @@ test("/maxout status reports the active learned profile", async () => {
   assert.match(text, /learning: reserve 8\.0K • 2 recent outputs • compaction pressure 1/);
 });
 
-test("unlearned models show no learning line until they observe something", async () => {
+test("unlearned models report the real cold cap without claiming learned history", async () => {
   h.ctx.getContextUsage = () => ({ tokens: 10000, contextWindow: LIMIT, percent: 8 });
   const out = h.emit.before_provider_request({ payload: vllmPayload() });
   assert.equal(out.max_tokens, 8000);
   await h.runCommand("status");
-  assert.doesNotMatch(h.ui.notifies.at(-1).message, /learning:/, "a cold-start-only profile is not 'learned'");
+  const text = h.ui.notifies.at(-1).message;
+  assert.match(text, /auto-adaptive \(cap 8\.0K @ low\)/);
+  assert.doesNotMatch(text, /learning:/, "a cold-start-only profile is not 'learned'");
 });
 
 test("/maxout learn reset clears only learning data", async () => {

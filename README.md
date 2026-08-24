@@ -14,7 +14,9 @@ cd pi-maxout
 
 The installer runs the bundled tests, atomically replaces
 `~/.pi/agent/extensions/pi-maxout/` (or `$PI_CODING_AGENT_DIR`), and keeps a
-timestamped backup of an existing install. Restart Pi or run `/reload`.
+timestamped backup under `~/.pi/agent/backups/pi-maxout/`. Backups and staging
+never live under `extensions/`, so Pi cannot discover them as duplicate live
+extensions. Restart Pi or run `/reload`.
 
 Use `./uninstall.sh` to remove the extension, or `./uninstall.sh --purge` to
 also remove saved settings.
@@ -43,6 +45,8 @@ On every main agent request (`before_provider_request`), the extension:
 4. **Patches the payload** field the provider adapter chose
    (`max_tokens`, `max_completion_tokens`, `max_output_tokens`,
    `generationConfig.maxOutputTokens`, …) without touching anything else.
+   Codex requests whose adapter intentionally omitted `max_output_tokens` are
+   left untouched; maxout never invents that rejected parameter.
 
 Tool-less active main requests are still budgeted. Idle summaries and active
 auto/overflow-compaction requests are explicitly excluded so they retain Pi
@@ -82,21 +86,20 @@ does not by itself force compaction when recent outputs are short. Fixed
 session/saved overrides bypass learning entirely, and unsupported payload
 APIs still fail open without creating a learnable attempt.
 
-## Thinking-level fallbacks
+## Thinking-level bounds
 
-When no profile has learned yet, auto mode falls back to the static targets:
+Auto starts conservatively and can learn upward to these ceilings:
 
-| level              | fallback |
-| ------------------ | -------- |
-| off/minimal/low/medium | 16 000 |
-| high               | 32 000 |
-| xhigh/max          | 56 000 (~50K reasoning + answer/tools) |
+| level | cold start | default ceiling |
+| ----- | ---------- | --------------- |
+| off/minimal/low/medium | 8 000 | 16 000 |
+| high | 16 000 | 32 000 |
+| xhigh/max | 32 000 | 56 000 |
 
 Targets clamp to actual headroom; they are never allowed to produce an
-oversized or zero/negative request. The adaptive ceiling also honors what the
-model advertises (`model.maxTokens`): a target above the advertised output
-limit clamps to it. Custom ceilings can be set per level via the state file
-(`targets`).
+oversized or zero/negative request. The effective adaptive target also honors
+what the model advertises (`model.maxTokens`). Custom ceilings can be set per
+level via the state file (`targets`).
 
 ## Overflow handling
 
@@ -133,6 +136,7 @@ compaction.
 | ------- | ------ |
 | `/maxout` / `/maxout status` | describe current mode, limits, margins, last patch |
 | `/maxout auto` / `/maxout save auto` | dynamic budgeting on (default); removes any session override AND saved fixed default for this model |
+| `/maxout off` | fully disable payload patching for every model; clears all session/saved fixed caps |
 | `/maxout 32k` … `/maxout max` | fixed cap for this session (still safety-clamped to remaining context) |
 | `/maxout save <spec>` | persist fixed cap; `/maxout save auto` enables auto and deletes the saved default |
 | `/maxout learn reset` | clear all learned adaptive budgets; fixed caps, context limits, margins, and custom ceilings are untouched |
@@ -149,14 +153,15 @@ automatically):
   "safetyMarginTokens": 2048,
   "targets": {},
   "contextLimits": {},
-  "defaults": {}
+  "defaults": {},
+  "adaptiveProfiles": {}
 }
 ```
 
 ## Development
 
-Pure logic lives in `auto.mjs` / `core.mjs` (zero dependencies);
-`index.ts` is thin glue. Tests: `npm test` (78 unit + integration tests,
+Pure logic lives in `adaptive.mjs`, `auto.mjs`, and `core.mjs` (zero dependencies);
+`index.ts` is runtime glue. Tests: `npm test` (122 unit + integration tests,
 including the original 67 347 + 63 726 → 131 073 regression).
 Typecheck: `npm run typecheck`.
 
