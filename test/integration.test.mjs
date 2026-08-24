@@ -207,7 +207,7 @@ test("state file persists margin/target/limit config and survives reload semanti
   await h.runCommand("margin 4096");
   const raw = JSON.parse(fs.readFileSync(h.agentDir + "/pi-maxout.json", "utf8"));
   assert.equal(raw.safetyMarginTokens, 4096);
-  assert.equal(raw.version, 2);
+  assert.equal(raw.version, 3);
 
   await h.runCommand("limit 100000");
   const raw2 = JSON.parse(fs.readFileSync(h.agentDir + "/pi-maxout.json", "utf8"));

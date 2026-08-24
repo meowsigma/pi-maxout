@@ -17,6 +17,18 @@ const localModel = {
   maxTokens: 16384,
 };
 
+test("state normalization emits the v3 schema with an empty adaptive table", () => {
+  assert.deepEqual(normalizeState({ version: 999, defaults: { "a:b": 32768, bad: -1, nope: "32k" } }), {
+    version: 3,
+    defaults: { "a:b": 32768 },
+    auto: true,
+    safetyMarginTokens: 2048,
+    targets: {},
+    contextLimits: {},
+    adaptiveProfiles: {},
+  });
+});
+
 test("modelKey is provider-scoped", () => {
   assert.equal(modelKey(localModel), "llamacpp:qwen.gguf");
   assert.equal(modelKey(undefined), null);
@@ -42,17 +54,7 @@ test("rejects values beyond context and max without metadata", () => {
 });
 
 test("normalizes state and drops malformed entries", () => {
-  assert.deepEqual(
-    normalizeState({ version: 999, defaults: { "a:b": 32768, bad: -1, nope: "32k" } }),
-    {
-      version: 2,
-      defaults: { "a:b": 32768 },
-      auto: true,
-      safetyMarginTokens: 2048,
-      targets: {},
-      contextLimits: {},
-    },
-  );
+  assert.equal(normalizeState({ version: 999, defaults: { "a:b": 32768, bad: -1, nope: "32k" } }).version, 3);
 });
 
 test("patches an existing OpenRouter/llama.cpp max_tokens field without mutation", () => {

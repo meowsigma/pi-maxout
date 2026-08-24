@@ -9,6 +9,8 @@ export type ModelLike = {
   compat?: unknown;
 };
 
+import type { AdaptiveProfile } from "./adaptive.mjs";
+
 export type MaxoutState = {
   version: number;
   defaults: Record<string, number>;
@@ -16,6 +18,7 @@ export type MaxoutState = {
   safetyMarginTokens: number;
   targets: Record<string, number>;
   contextLimits: Record<string, number>;
+  adaptiveProfiles: Record<string, AdaptiveProfile>;
 };
 
 export type TokenSpec =

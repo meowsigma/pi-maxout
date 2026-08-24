@@ -1,10 +1,12 @@
-export const STATE_VERSION = 2;
+export const STATE_VERSION = 3;
 
 /** Default safety margin (tokens) when unconfigured. Must stay >= MIN_MARGIN_TOKENS. */
 const DEFAULT_STATE_MARGIN = 2048;
 const MIN_STATE_MARGIN = 1024;
 const KNOWN_TARGET_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const UNSAFE_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+
+import { normalizeAdaptiveProfile } from "./adaptive.mjs";
 
 export function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -86,20 +88,22 @@ export function parseTokenSpec(raw, model, options = {}) {
 }
 
 /**
- * Normalize persisted state to the v2 schema.
+ * Normalize persisted state to the v3 schema.
  *
  * Shape:
  *   {
- *     version: 2,
+ *     version: 3,
  *     defaults: { "provider:model": fixedMaxTokens },   // legacy v1 overrides
  *     auto: boolean,                                    // dynamic budgeting on/off
  *     safetyMarginTokens: number,                       // >= 1024
  *     targets: { level: tokens },                       // per-thinking-level targets
- *     contextLimits: { "provider:model": tokens }       // per-model context-limit fixes
+ *     contextLimits: { "provider:model": tokens },      // per-model context-limit fixes
+ *     adaptiveProfiles: { "provider:model:level": profile } // learned auto budgets
  *   }
  *
- * Accepts v1 files ({version:1, defaults}) and arbitrary garbage; output is
- * always safe and complete.
+ * Accepts v1/v2 files and arbitrary garbage; output is always safe and
+ * complete. Profile validation/repair is delegated to the pure controller in
+ * adaptive.mjs (no filesystem dependencies there).
  */
 export function normalizeState(value) {
   const src = isRecord(value) ? value : {};
@@ -135,7 +139,34 @@ export function normalizeState(value) {
     }
   }
 
-  return { version: STATE_VERSION, defaults, auto, safetyMarginTokens, targets, contextLimits };
+  const adaptiveProfiles = {};
+  if (isRecord(src.adaptiveProfiles)) {
+    for (const [key, candidate] of Object.entries(src.adaptiveProfiles)) {
+      if (!isRecord(candidate)) continue;
+      if (typeof key !== "string" || key.length === 0 || UNSAFE_KEYS.has(key)) continue;
+      // Entries without a single recognizable learned field are junk, not
+      // merely corrupt: drop them instead of materializing empty profiles.
+      const hasLearnedSignal =
+        (Number.isSafeInteger(candidate.capTarget) && candidate.capTarget > 0) ||
+        (Number.isSafeInteger(candidate.reservationTarget) && candidate.reservationTarget > 0) ||
+        (Number.isSafeInteger(candidate.updatedAt) && candidate.updatedAt > 0) ||
+        Array.isArray(candidate.outputs);
+      if (!hasLearnedSignal) continue;
+      // The thinking level is the key's last colon-separated segment.
+      const level = key.slice(key.lastIndexOf(":") + 1);
+      adaptiveProfiles[key] = normalizeAdaptiveProfile(candidate, { level });
+    }
+  }
+
+  return {
+    version: STATE_VERSION,
+    defaults,
+    auto,
+    safetyMarginTokens,
+    targets,
+    contextLimits,
+    adaptiveProfiles,
+  };
 }
 
 function cloneRoot(payload) {
